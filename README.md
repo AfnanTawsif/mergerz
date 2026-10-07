@@ -3,6 +3,7 @@
 <p align="center">
   <img src="./media/screenshot1.webp" alt="Mergerz main menu" width="600">
 </p>
+**[View all screenshots →](./media/screenshots.md)**
 
 # Introduction
 
@@ -15,11 +16,6 @@ The goal is simple:
 Mergerz is built around a **PDF-native editing philosophy**. Operations such as invert, crop, rotate, flip, stretch, and other page transformations are performed directly on PDF pages and their underlying content whenever possible, rather than unnecessarily rasterizing the entire page.
 
 This means less unnecessary bloat, faster processing, better scalability, and better preservation of vectors, text, and overall document quality.
-
-See Mergerz in action across its workflows:
-
-**[View all screenshots →](./media/screenshots.md)**
-
 
 # Installation
 

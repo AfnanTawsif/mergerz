@@ -6,7 +6,7 @@
 
 # Introduction
 
-**Mergerz is a free, PDF focused desktop utility for editing, organizing, transforming, optimizing, securing, converting, printing, and presenting documents - all from one fast, PDF-native workflow.** It combines a full visual PDF editor with page design, N-up layouts, OCR, image optimization, PDF/image conversion, PDF-to-DOCX, and document conversion tools, while preserving native text, vectors, and page content wherever possible.
+**Mergerz is a free, PDF-focused desktop utility for editing, organizing, transforming, optimizing, securing, converting, and presenting documents—with a PDF-native workflow that preserves text, vectors, page content and quality.**
 
 The goal is simple:
 
@@ -16,7 +16,6 @@ Mergerz is built around a **PDF-native editing philosophy**. Operations such as 
 
 This means less unnecessary bloat, faster processing, better scalability, and better preservation of vectors, text, and overall document quality.
 
----
 
 ## Screenshots
 
@@ -24,7 +23,6 @@ See Mergerz in action across its workflows:
 
 **[View all screenshots →](./media/screenshots.md)**
 
----
 
 # Installation
 

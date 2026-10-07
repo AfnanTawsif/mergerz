@@ -4,12 +4,6 @@
   <img src="./media/screenshot1.webp" alt="Mergerz main menu">
 </p>
 
-<h1 align="center">Mergerz</h1>
-
-<p align="center">
-  From a small ~600-line CLI utility to a 50,000+ line desktop application built around performance, customization and PDF-native processing.
-</p>
-
 ---
 
 ## Introduction

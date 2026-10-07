@@ -3,6 +3,7 @@
 <p align="center">
   <img src="./media/screenshot1.webp" alt="Mergerz main menu" width="600">
 </p>
+
 **[View all screenshots →](./media/screenshots.md)**
 
 # Introduction

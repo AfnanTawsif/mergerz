@@ -22,7 +22,7 @@ This means less unnecessary bloat, faster processing, better scalability, and be
 
 See Mergerz in action across its workflows:
 
-**[View all screenshots →](./screenshots/screenshots.md)**
+**[View all screenshots →](./media/screenshots.md)**
 
 ---
 

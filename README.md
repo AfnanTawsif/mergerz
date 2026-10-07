@@ -8,15 +8,15 @@
 
 ## Introduction
 
-Mergerz is a full-fledged desktop application with a sleek PySide6 interface, a complete PDF editor, native page transformations, advanced PDF optimization, image optimization, OCR, PDF security, document conversion, N-up composition, presentation mode, plugin management, automatic application updates, configurable multiprocessing, memory-safety controls and much more.
+**Mergerz is a free, PDF-focused desktop utility for editing, organizing, transforming, optimizing, securing, converting, printing, and presenting documents—all from one fast, PDF-native workflow.** It combines a full visual PDF editor with page design, N-up layouts, OCR, image optimization, PDF/image conversion, PDF-to-DOCX, and document conversion tools, while preserving native text, vectors, and page content wherever possible.
 
 The goal is simple:
 
 > **Do more to your documents without unnecessarily destroying what is already inside them.**
 
-Mergerz is designed around a **PDF-native editing philosophy**. Operations such as invert, crop, rotate, flip, stretch and everything else are processed at the PDF/content level instead of flattening an entire page into a raster image.
+Mergerz is built around a **PDF-native editing philosophy**. Operations such as invert, crop, rotate, flip, stretch, and other page transformations are performed directly on PDF pages and their underlying content whenever possible, rather than unnecessarily rasterizing the entire page.
 
-That means less unnecessary bloat, faster processing, better scalability and better preservation of vectors, text and document quality.
+This means less unnecessary bloat, faster processing, better scalability, and better preservation of vectors, text, and overall document quality.
 
 ---
 

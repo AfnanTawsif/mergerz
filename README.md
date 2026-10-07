@@ -34,13 +34,13 @@ See Mergerz in action across its workflows:
 Optional functionality such as OCR, PDF-to-DOCX and LibreOffice conversion can be installed separately through Mergerz's plugin system.
 
 
-## Install from PyPI
+## Install & Launch
 
 Install or upgrade Mergerz with:
 
 `python -m pip install --upgrade mergerz`
 
-Then launch:
+Then launch using:
 
 `mergerz`
 

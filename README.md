@@ -1,7 +1,7 @@
 [![PyPI](https://img.shields.io/pypi/v/mergerz?style=flat-square&label=PyPI)](https://pypi.org/project/mergerz/) [![Python](https://img.shields.io/pypi/pyversions/mergerz?style=flat-square&label=Python)](https://pypi.org/project/mergerz/)
 
 <p align="center">
-  <img src="./media/screenshot1.webp" alt="Mergerz main menu">
+  <img src="./media/screenshot1.webp" alt="Mergerz main menu" width="600">
 </p>
 
 # Introduction

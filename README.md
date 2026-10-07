@@ -14,7 +14,7 @@ The goal is simple:
 
 > **Do more to your documents without unnecessarily destroying what is already inside them.**
 
-Mergerz is built around a **PDF-native editing philosophy**. Operations such as invert, crop, rotate, flip, stretch, filters, n-up, page design and other page transformations are performed directly on PDF pages and their underlying content whenever possible, rather than unnecessarily rasterizing the entire page.
+Mergerz is built around a **PDF-native editing philosophy**. Operations such as invert, crop, rotate, flip, stretch, filters, n-up, page design and all other page transformations are performed directly on PDF pages and their underlying content rather than unnecessarily rasterizing the entire page.
 
 This means less unnecessary bloat, faster processing, better scalability, and better preservation of vectors, text, and overall document quality.
 

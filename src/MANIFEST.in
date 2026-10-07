@@ -1,0 +1,4 @@
+include README.md
+include LICENSE.txt
+recursive-include mergerz/icons *.svg
+recursive-include mergerz/fonts *.ttf

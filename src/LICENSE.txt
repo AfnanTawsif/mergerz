@@ -1,0 +1,9 @@
+Copyright © 2026 Afnan Tawsif
+
+All rights reserved.
+
+This software and its source code, compiled forms, documentation, artwork,
+icons, fonts, and other associated assets are proprietary to Afnan Tawsif.
+No permission is granted to copy, modify, distribute, sublicense, publish,
+sell, or otherwise use any portion of this software except as expressly
+authorized in writing by the copyright holder.

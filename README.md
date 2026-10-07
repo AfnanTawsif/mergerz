@@ -27,7 +27,6 @@ This means less unnecessary bloat, faster processing, better scalability, and be
 
 Optional functionality such as OCR, PDF-to-DOCX and LibreOffice conversion can be installed separately through Mergerz's plugin system.
 
-
 ## Install & Launch
 
 Install or upgrade Mergerz with:
@@ -74,7 +73,7 @@ Long-running operations expose live progress and logs, with cancellation support
 
 ### Smart memory handling
 
-Processes like thumbnail rendering includes memory-safety logic and configurable memory policies to reduce the chance of exhausting RAM on large documents.
+Memory-intensive processes such as thumbnail rendering include memory-safety logic and configurable memory policies to reduce the risk of exhausting RAM on large documents.
 
 ### Automatic application updates
 
@@ -84,11 +83,9 @@ Mergerz can quietly check PyPI after startup, notify you when a newer version ex
 
 Heavy optional features are separated from the core installation. OCR, PDF-to-DOCX and LibreOffice functionality can be installed, updated or removed independently.
 
-
 ### Sleek dark UI
 
 The application uses a custom dark desktop interface with custom window chrome, responsive layouts, modern dialogs, live previews and carefully designed workflow screens.
-
 
 **[Explore all features →](./docs/features.md)**
 
@@ -122,9 +119,9 @@ Use temporary output, verification and atomic replacement whenever practical.
 
 ### 6. Never ruin previous edits.
 
-New edit operations are done on top of previous editing results, so that we can expected outputs.
+New edit operations build on previous editing results instead of unexpectedly discarding earlier changes.
 
-### 6. Performance should scale with the workload.
+### 7. Performance should scale with the workload.
 
 Small tasks should stay lightweight.
 

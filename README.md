@@ -16,9 +16,6 @@ Mergerz is built around a **PDF-native editing philosophy**. Operations such as 
 
 This means less unnecessary bloat, faster processing, better scalability, and better preservation of vectors, text, and overall document quality.
 
-
-## Screenshots
-
 See Mergerz in action across its workflows:
 
 **[View all screenshots →](./media/screenshots.md)**

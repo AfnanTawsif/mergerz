@@ -49,7 +49,7 @@ Mergerz is designed as a free desktop utility rather than a subscription-based d
 
 ### PDF-native by design
 
-The editor is built to avoid full-page rasterization for ordinary PDF editing operations. Text, vector artwork and page geometry can remain native instead of being flattened into a giant image.
+Mergerz is built to avoid full-page rasterization for PDF editing operations. Text, vector artwork and page geometry can remain native instead of being flattened into a giant image.
 
 ### Full desktop application
 
@@ -95,11 +95,11 @@ The application uses a custom dark desktop interface with custom window chrome, 
 
 Mergerz is built around a few principles:
 
-### 1. Don't rasterize what does not need to be rasterized.
+### 1. Don't rasterize unless the user explicitly chooses features like pdf to image.
 
 A PDF already contains structured content.
 
-Crop, rotation, flipping, stretch, page numbering, borders, watermarks and core filtering workflows are designed to operate on the document rather than turning the whole page into a screenshot first.
+All workflows are designed to operate on the document rather than turning the whole page into a screenshot first.
 
 ### 2. Heavy dependencies should be optional.
 

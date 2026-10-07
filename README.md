@@ -1,10 +1,10 @@
 [![PyPI](https://img.shields.io/pypi/v/mergerz?style=flat-square&label=PyPI)](https://pypi.org/project/mergerz/) [![Python](https://img.shields.io/pypi/pyversions/mergerz?style=flat-square&label=Python)](https://pypi.org/project/mergerz/)
 
-<h1 align="center">Mergerz</h1>
-
 <p align="center">
   <img src="./media/screenshot1.webp" alt="Mergerz main menu">
 </p>
+
+<h1 align="center">Mergerz</h1>
 
 <p align="center">
   From a small ~600-line CLI utility to a 50,000+ line desktop application built around performance, customization and PDF-native processing.

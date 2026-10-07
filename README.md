@@ -1,6 +1,6 @@
 [![PyPI](https://img.shields.io/pypi/v/mergerz?style=flat-square&label=PyPI)](https://pypi.org/project/mergerz/) [![Python](https://img.shields.io/pypi/pyversions/mergerz?style=flat-square&label=Python)](https://pypi.org/project/mergerz/)
 <h1 align="center">Mergerz</h1>
-![Mergerz main menu](./media/screenshot1.jpg)
+![Mergerz main menu](./media/screenshot1.webp)
 <p align="center">
   <b>A full-featured desktop PDF workspace for editing, organizing, optimizing, converting and printing documents.</b>
 </p>

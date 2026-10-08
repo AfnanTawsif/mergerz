@@ -63,6 +63,9 @@ Install it and launch:
 
 Mergerz is no longer just a PDF merger. It now combines document editing, printing, optimization, conversion, OCR, security, page design, image processing and workflow automation in one application.
 
+**[Explore all features →](./docs/features.md)**
+
+
 ### Performance-focused
 
 CPU-heavy tasks use background workers and multiprocessing where beneficial. Operations can use configurable worker counts, thresholds, temporary storage and memory policies.
@@ -86,8 +89,6 @@ Heavy optional features are separated from the core installation. OCR, PDF-to-DO
 ### Sleek dark UI
 
 The application uses a custom dark desktop interface with custom window chrome, responsive layouts, modern dialogs, live previews and carefully designed workflow screens.
-
-**[Explore all features →](./docs/features.md)**
 
 ---
 

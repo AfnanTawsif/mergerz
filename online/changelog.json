@@ -1,0 +1,27 @@
+[
+  {
+    "version": "v5.0.9",
+    "logs": [
+      "Updated databse & icons link"
+    ]
+  }
+  {
+    "version": "v5.0.8",
+    "logs": [
+      "Full visual PDF editor with page organization and editing",
+      "PDF-native crop, rotate, flip, stretch, filters, and page design",
+      "N-up page composition and presentation workflows",
+      "PDF viewing, search, bookmarks, printing, and presentation mode",
+      "PDF merging and selected-page operations",
+      "PDF optimization and batch image optimization",
+      "PDF/image conversion with JPG, PNG, and WebP support",
+      "OCR through an optional plugin",
+      "PDF-to-DOCX and LibreOffice conversion through optional plugins",
+      "PDF security and unlock tools",
+      "Plugin management with independent installation and updates",
+      "Automatic application updates",
+      "Configurable multiprocessing and memory-aware processing",
+      "AND A LOT MORE..............."
+    ]
+  }
+]

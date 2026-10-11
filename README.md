@@ -26,7 +26,7 @@ This means less unnecessary bloat, faster processing, better scalability, and be
 - Windows / Linux / macOS / other PySide6-supported platforms.
 - Python 3.10 or newer.
 
-For Windows, you must select **Add Python to PATH** during Python installation.
+For Windows, use the windows installer for python (not the install manager). And during installation you must select **Add Python to PATH**.
 
 The app is heavily tested only on Kubuntu.
 

@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 # IMPORTANT: Changelogs are never saved in the project source code.
-# SOURCE VERSION: 5.0.8 (Mergerz GUI release with bundled resources and post-launch self-update support)
+# SOURCE VERSION: 5.0.9 (Mergerz GUI release with bundled resources and post-launch self-update support)
 
 import os
 import sys
 import time
-import contextlib
 import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
@@ -17,7 +16,6 @@ import logging
 import re
 import shutil
 import math
-import random
 import uuid
 import platform
 import subprocess
@@ -34,7 +32,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from pathlib import Path
-from multiprocessing import Process, Value, Lock
+from multiprocessing import Value, Lock
 
 from PIL import Image, ImageOps, ImageChops, ImageDraw, ImageFont, PngImagePlugin
 import pymupdf as fitz
@@ -104,6 +102,8 @@ _QTHREAD_REGISTRY_LOCK = threading.RLock()
 # QThread, so it needs the same application-exit fence.
 _PROCESS_BRIDGE_REGISTRY = set()
 _PROCESS_BRIDGE_REGISTRY_LOCK = threading.RLock()
+# Serialize settings read-modify-write transactions across GUI and background workers.
+_SETTINGS_IO_LOCK = threading.RLock()
 
 
 def _forget_tracked_qthread(thread):
@@ -391,7 +391,7 @@ except Exception:
     QSvgRenderer = None
     _HAS_QT_SVG = False
 
-__version__ = "5.0.8"
+__version__ = "5.0.9"
 
 # ============================================================
 # RESOURCE / WORKING-DIRECTORY PATHS
@@ -471,6 +471,9 @@ A4_HEIGHT_PT = 841.8897637795276
 
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
+    "app_state": {
+        "auto_changelog_opened_version": None,
+    },
     "multiprocessing": {
         "thumbnail_generation": {
             "processes": DEFAULT_CPU_WORKER_COUNT,
@@ -848,23 +851,43 @@ def _validate_settings(data):
 
 
 def _write_settings_file(data):
-    """Atomically persist settings so a partial write cannot corrupt settings.json."""
-    tmp_path = SETTINGS_FILE + ".tmp"
+    """Atomically persist settings using a unique same-directory temporary file."""
+    settings_dir = os.path.dirname(os.path.abspath(SETTINGS_FILE)) or os.getcwd()
+    tmp_path = None
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        os.replace(tmp_path, SETTINGS_FILE)
+        os.makedirs(settings_dir, exist_ok=True)
+        with _SETTINGS_IO_LOCK:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(SETTINGS_FILE)}-",
+                suffix=".tmp",
+                dir=settings_dir,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp_path, SETTINGS_FILE)
+            tmp_path = None
         return True
     except Exception as exc:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path:
+            try: os.remove(tmp_path)
+            except Exception: pass
         print(f"Could not save settings.json: {exc}")
         return False
 
+
+def _normalize_app_state(data):
+    """Keep only the current-version auto-changelog marker in settings.json."""
+    if not isinstance(data, dict):
+        return data
+    state = data.get("app_state")
+    marker = state.get("auto_changelog_opened_version") if isinstance(state, dict) else None
+    if marker is not None:
+        marker = str(marker).strip() or None
+    normalized = {"auto_changelog_opened_version": marker}
+    if data.get("app_state") != normalized:
+        data["app_state"] = normalized
+    return data
 
 
 def _migrate_settings(data):
@@ -941,6 +964,7 @@ def _migrate_settings(data):
     if isinstance(mp, dict):
         mp.pop("image_downscaling", None)
     migrated["settings_version"]=SETTINGS_VERSION
+    _normalize_app_state(migrated)
     return migrated
 
 
@@ -1007,6 +1031,14 @@ def _repair_current_settings(data):
             repaired[key] = copy.deepcopy(value)
 
     repaired["settings_version"] = SETTINGS_VERSION
+    state = data.get("app_state")
+    if isinstance(state, dict):
+        marker = state.get("auto_changelog_opened_version")
+        if marker is None or isinstance(marker, str):
+            repaired["app_state"] = {
+                "auto_changelog_opened_version": (str(marker).strip() or None)
+                if marker is not None else None
+            }
     if _validate_settings(repaired):
         return repaired
     return defaults
@@ -1017,6 +1049,10 @@ def _load_app_settings():
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if _validate_settings(data):
+            previous_app_state = copy.deepcopy(data.get("app_state"))
+            _normalize_app_state(data)
+            if data.get("app_state") != previous_app_state:
+                _write_settings_file(data)
             mp = data.get("multiprocessing")
             legacy_thumb = (
                 isinstance(mp, dict)
@@ -1090,40 +1126,20 @@ def _save_use_memory_preference(mode):
 
 
 def _save_application_settings(new_settings):
-    """Persist the complete Settings page state in one atomic settings update."""
+    """Persist the complete Settings page state in one serialized atomic update."""
     global APP_SETTINGS
-    candidate = _clone_default_settings()
-    candidate["multiprocessing"] = json.loads(
-        json.dumps(new_settings.get("multiprocessing", candidate["multiprocessing"])))
-    candidate["advanced"] = json.loads(
-        json.dumps(new_settings.get("advanced", candidate["advanced"])))
-    # OCR language metadata is application cache, not editable Settings.
-    # Always preserve the live cache when unrelated Settings values are saved.
-    candidate["ocr"] = json.loads(
-        json.dumps(APP_SETTINGS.get("ocr", candidate["ocr"])))
-    candidate["libreoffice"] = json.loads(
-        json.dumps(APP_SETTINGS.get("libreoffice", candidate["libreoffice"])))
-    candidate["settings_version"] = SETTINGS_VERSION
-    if not _validate_settings(candidate):
-        raise ValueError("Invalid application settings")
-    if not _write_settings_file(candidate):
-        raise RuntimeError("settings.json could not be written.")
-    APP_SETTINGS = candidate
-    return _get_app_settings_snapshot()
-
-
-def _save_multiprocessing_settings(new_mp_settings):
-    """Persist multiprocessing settings while preserving all non-MP settings."""
-    global APP_SETTINGS
-    candidate = _get_app_settings_snapshot()
-    candidate["settings_version"] = SETTINGS_VERSION
-    candidate["multiprocessing"] = json.loads(json.dumps(new_mp_settings))
-    if not _validate_settings(candidate):
-        raise ValueError("Invalid multiprocessing settings")
-    if not _write_settings_file(candidate):
-        raise RuntimeError("settings.json could not be written.")
-    APP_SETTINGS = candidate
-    return _get_multiprocessing_settings_snapshot()
+    with _SETTINGS_IO_LOCK:
+        candidate = _clone_default_settings()
+        candidate["multiprocessing"] = json.loads(json.dumps(new_settings.get("multiprocessing", candidate["multiprocessing"])))
+        candidate["advanced"] = json.loads(json.dumps(new_settings.get("advanced", candidate["advanced"])))
+        candidate["ocr"] = json.loads(json.dumps(APP_SETTINGS.get("ocr", candidate["ocr"])))
+        candidate["libreoffice"] = json.loads(json.dumps(APP_SETTINGS.get("libreoffice", candidate["libreoffice"])))
+        candidate["app_state"] = copy.deepcopy(APP_SETTINGS.get("app_state", candidate["app_state"]))
+        candidate["settings_version"] = SETTINGS_VERSION
+        if not _validate_settings(candidate): raise ValueError("Invalid application settings")
+        if not _write_settings_file(candidate): raise RuntimeError("settings.json could not be written.")
+        APP_SETTINGS = candidate
+        return _get_app_settings_snapshot()
 
 
 APP_SETTINGS = _load_app_settings()
@@ -1182,7 +1198,19 @@ def _thumbnail_target_width_for_dpi(page_rect, dpi):
 # ============================================================
 # INLINE SVG ICONS
 # ============================================================
+_AUTHOR_FALLBACK_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="112" height="112" viewBox="0 0 112 112">'
+    '<defs><clipPath id="circle-clip"><circle cx="56" cy="56" r="55"/></clipPath></defs>'
+    '<circle cx="56" cy="56" r="55" fill="#282b30"/>'
+    '<g clip-path="url(#circle-clip)">'
+    '<circle cx="56" cy="40" r="19" fill="#707984"/>'
+    '<path d="M17 112 C19 80, 36 70, 56 70 C76 70, 93 80, 95 112 Z" fill="#707984"/>'
+    '</g>'
+    '</svg>'
+)
+
 _SVG_ICONS = {
+    "author.svg": _AUTHOR_FALLBACK_SVG,
     "logo2.svg": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
         '<defs>'
@@ -1411,6 +1439,15 @@ _SVG_ICONS = {
         '<path d="M18 1.5c0 2-1 3.5-3.5 3.5 2.5 0 3.5 1.5 3.5 3.5 0-2 1-3.5 3.5-3.5-2.5 0-3.5-1.5-3.5-3.5z"/>'
         '<path d="M21 9c0 1-.5 1.5-1.5 1.5 1 0 1.5.5 1.5 1.5 0-1 .5-1.5 1.5-1.5-1 0-1.5-.5-1.5-1.5z"/>'
         '</svg>'),
+    "uv-update.svg": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="#f0f0f0" stroke-linecap="round" stroke-linejoin="round">'
+        '<!-- Styled Arrowhead & Stem -->'
+        '<path d="M12 2 L21 10 H15.5 V18 H8.5 V10 H3 Z" stroke-width="1.5"/>'
+        '<!-- Decorative Tail Accent (Base Rings/Cap) -->'
+        '<line x1="7.5" y1="20.5" x2="16.5" y2="20.5" stroke-width="1.8"/>'
+        '<line x1="8.5" y1="22.5" x2="15.5" y2="22.5" stroke-width="1.8"/>'
+        '</svg>'),
     "libreoffice.svg": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#f0f0f0" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
         '<path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/>'
@@ -1436,6 +1473,14 @@ _SVG_ICONS = {
         '<rect x="13" y="3" width="8" height="8" rx="1.5"/>'
         '<rect x="3" y="13" width="8" height="8" rx="1.5"/>'
         '<path d="M14.5 17.5l2 2 4-4"/>'
+        '</svg>'),
+    "pan.svg": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="#f0f0f0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+        '<path d="M7.8 11V6.2a1.65 1.65 0 0 1 3.3 0V10"/>'
+        '<path d="M11.1 9V4.9a1.65 1.65 0 0 1 3.3 0V10"/>'
+        '<path d="M14.4 9V6a1.65 1.65 0 0 1 3.3 0v5"/>'
+        '<path d="M17.7 10.3V9a1.65 1.65 0 0 1 3.3 0v6.5a6 6 0 0 1-6 6h-2.3a6 6 0 0 1-4.8-2.4l-3.1-4.2a1.8 1.8 0 0 1 2.7-2.4L7.8 14V11"/>'
         '</svg>'),
     "undo.svg": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
@@ -1626,6 +1671,11 @@ def _ensure_icons_exist():
         os.makedirs(ICONS_FOLDER, exist_ok=True)
         for name, content in _SVG_ICONS.items():
             path = os.path.join(ICONS_FOLDER, name)
+            # Use the canonical, current author placeholder when creating a missing
+            # test-mode file. Existing on-disk SVGs are intentionally never overwritten:
+            # TEST MODE treats icons/ as the editable source of truth.
+            if name == "author.svg":
+                content = _AUTHOR_FALLBACK_SVG
             if os.path.isfile(path):
                 continue
             try:
@@ -1696,15 +1746,50 @@ def _render_svg_icon_pixmap(path, size=26, muted=False):
 
 
 def _render_svg_icon(path, size=26, color=None):
+    """Render an on-disk SVG first, falling back to its embedded design if needed.
+
+    No rendered-icon cache is used intentionally: restarting TEST MODE after editing
+    an SVG on disk always picks up the latest file. In TEST MODE the working-directory
+    icon wins; in normal mode the packaged icon wins. The embedded copy is only a
+    fallback for a missing or invalid file.
+    """
     pix_normal = _render_svg_icon_pixmap(path, size, muted=False)
     if pix_normal is None:
-        return None
+        return _render_embedded_svg_icon(os.path.basename(os.fspath(path)), size=size)
     icon = QtGui.QIcon()
     icon.addPixmap(pix_normal, QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off)
     pix_muted = _render_svg_icon_pixmap(path, size, muted=True)
     if pix_muted is not None:
         icon.addPixmap(pix_muted, QtGui.QIcon.Mode.Disabled, QtGui.QIcon.State.Off)
     return icon
+
+
+def _render_embedded_svg_icon(name, size=26):
+    """Render an SVG from _SVG_ICONS without writing into the installed package."""
+    if not _HAS_QT_SVG:
+        return None
+    svg = _SVG_ICONS.get(str(name))
+    if not svg:
+        return None
+    try:
+        renderer = QSvgRenderer(QtCore.QByteArray(svg.encode("utf-8")))
+        if not renderer.isValid():
+            return None
+        pixmap = QtGui.QPixmap(int(size), int(size))
+        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        renderer.render(painter)
+        painter.end()
+        icon = QtGui.QIcon()
+        icon.addPixmap(pixmap, QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off)
+        muted = _make_muted_pixmap(pixmap)
+        if muted is not None:
+            icon.addPixmap(muted, QtGui.QIcon.Mode.Disabled, QtGui.QIcon.State.Off)
+        return icon
+    except Exception:
+        return None
 
 
 def _render_svg_icon_rotated(path, size, angle_deg):
@@ -1931,11 +2016,17 @@ class _WindowTitleBar(QtWidgets.QWidget):
 
 
 class _WindowChromeManager(QtCore.QObject):
-    """Application-wide installer for the custom title bar on all top-level dialogs/windows."""
+    """Install custom chrome on Linux/macOS and native frames on Windows.
+
+    Native Windows non-client hit testing is intentionally retained on Windows:
+    converting overlapping modal dialogs into masked frameless windows caused
+    unreliable mouse-down routing for title-bar controls and content buttons.
+    """
     def __init__(self, app):
         super().__init__(app)
         self._app = app
         self._installed = {}
+        self._native_installed = set()
         app.installEventFilter(self)
 
     @staticmethod
@@ -1957,6 +2048,36 @@ class _WindowChromeManager(QtCore.QObject):
         if not self._is_real_top_level(window):
             return
         key = id(window)
+
+        # Windows' native non-client area handles overlapping owned/modal HWNDs
+        # correctly. Keep real OS title-bar buttons and native resize hit testing
+        # there instead of relying on a masked child title bar plus a global
+        # MouseButtonPress filter. The latter combination can produce hover
+        # feedback without delivering the corresponding press/click on Windows.
+        if os.name == "nt":
+            if key in self._native_installed:
+                return
+            was_visible = bool(window.isVisible())
+            flags = window.windowFlags()
+            flags &= ~QtCore.Qt.WindowType.FramelessWindowHint
+            flags |= (
+                QtCore.Qt.WindowType.WindowTitleHint
+                | QtCore.Qt.WindowType.WindowSystemMenuHint
+                | QtCore.Qt.WindowType.WindowMinimizeButtonHint
+                | QtCore.Qt.WindowType.WindowMaximizeButtonHint
+                | QtCore.Qt.WindowType.WindowCloseButtonHint
+            )
+            self._native_installed.add(key)
+            window.setProperty("_mergerz_native_windows_chrome", True)
+            if flags != window.windowFlags():
+                window.setWindowFlags(flags)
+                # Changing flags on a visible QWidget hides it; immediately show
+                # it again so the one-time Windows fallback is safe even if a
+                # custom dialog is first encountered during its Show event.
+                if was_visible:
+                    window.show()
+            return
+
         if key in self._installed:
             bar = self._installed[key]
             try:
@@ -2181,21 +2302,6 @@ def _pil_to_qpixmap(img):
     return QtGui.QPixmap.fromImage(qimg.copy())
 
 
-def _invert_qpixmap(pixmap):
-    """Fast screen-preview equivalent of the PDF-native white/Difference inversion.
-
-    Saved PDFs and delayed exact previews use the isolated DeviceRGB Form-XObject implementation.
-    This helper remains raster-only because the GUI must produce pixels for immediate display.
-    """
-    if pixmap is None or pixmap.isNull():
-        return pixmap
-    out = QtGui.QPixmap(pixmap.size())
-    out.fill(QtGui.QColor("#ffffff"))
-    painter = QtGui.QPainter(out)
-    painter.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_Difference)
-    painter.drawPixmap(0, 0, pixmap)
-    painter.end()
-    return out
 
 
 # ============================================================
@@ -2400,31 +2506,6 @@ def _tint_color(value):
                  for i in range(3))
 
 
-def _tone_lut(config):
-    cfg = _normalize_filter_config(config)
-    black = cfg["black_point"] / 100.0
-    white = cfg["white_point"] / 100.0
-    gamma = cfg["gamma"]
-    brightness = cfg["brightness"] / 100.0
-    contrast = 1.0 + cfg["contrast"] / 100.0
-    threshold_amount = cfg["threshold"] / 100.0
-    invert_amount = cfg["invert"] / 100.0
-    if white <= black + 1e-5:
-        white = min(1.0, black + 1e-5)
-
-    lut = []
-    for i in range(256):
-        x = i / 255.0
-        x = max(0.0, min(1.0, (x - black) / (white - black)))
-        x = max(0.0, min(1.0, x ** (1.0 / gamma)))
-        x = max(0.0, min(1.0, (x - 0.5) * contrast + 0.5 + brightness))
-        if threshold_amount > 0:
-            hard = 1.0 if x >= 0.5 else 0.0
-            x = x * (1.0 - threshold_amount) + hard * threshold_amount
-        if invert_amount > 0:
-            x = x * (1.0 - invert_amount) + (1.0 - x) * invert_amount
-        lut.append(int(round(max(0.0, min(1.0, x)) * 255.0)))
-    return lut
 
 
 def _blend_pil_layer(base, rgb, amount, mode):
@@ -2577,16 +2658,6 @@ def _qt_composition_mode(mode):
     return mapping.get(mode, composition_mode.CompositionMode_SourceOver)
 
 
-def _paint_filter_overlay_qpixmap(pixmap, rgb, mode, opacity):
-    if pixmap is None or pixmap.isNull() or opacity <= 1e-6:
-        return pixmap
-    out = QtGui.QPixmap(pixmap)
-    painter = QtGui.QPainter(out)
-    painter.setCompositionMode(_qt_composition_mode(mode))
-    painter.setOpacity(max(0.0, min(1.0, float(opacity))))
-    painter.fillRect(out.rect(), QtGui.QColor(*rgb))
-    painter.end()
-    return out
 
 
 def _apply_filter_to_qpixmap(pixmap, config):
@@ -2607,53 +2678,6 @@ def _ps_num(value):
     return f"{float(value):.8g}"
 
 
-def _build_pdf_transfer_function_ps(config):
-    """Build a conservative Type 4 function for component-wise tone edits."""
-    cfg = _normalize_filter_config(config)
-    black = cfg["black_point"] / 100.0
-    white = cfg["white_point"] / 100.0
-    gamma = cfg["gamma"]
-    brightness = cfg["brightness"] / 100.0
-    contrast = 1.0 + cfg["contrast"] / 100.0
-    threshold_amount = cfg["threshold"] / 100.0
-    invert_amount = cfg["invert"] / 100.0
-    if white <= black + 1e-5:
-        white = min(1.0, black + 1e-5)
-
-    parts = [
-        f"{_ps_num(black)} sub",
-        f"{_ps_num(white - black)} div",
-        "dup 0 lt { pop 0 } if",
-        "dup 1 gt { pop 1 } if",
-        f"{_ps_num(1.0 / gamma)} exp",
-        f"{_ps_num(contrast)} mul",
-        "0.5 sub",
-        f"{_ps_num(brightness)} add",
-        "0.5 add",
-        "dup 0 lt { pop 0 } if",
-        "dup 1 gt { pop 1 } if",
-    ]
-    if threshold_amount > 0:
-        # Stack: y -> y, hard -> hard*(1-a), y -> y*(1-a), then add.
-        parts.extend([
-            "dup", "0.5 ge { 1 } { 0 } ifelse",
-            "exch",
-            f"{_ps_num(1.0 - threshold_amount)} mul",
-            "exch",
-            f"{_ps_num(threshold_amount)} mul",
-            "add",
-        ])
-    if invert_amount > 0:
-        # y = y*(1-a) + (1-y)*a
-        parts.extend([
-            "dup", f"{_ps_num(1.0 - invert_amount)} mul",
-            "exch", "1 exch sub", f"{_ps_num(invert_amount)} mul", "add",
-        ])
-    parts.extend([
-        "dup 0 lt { pop 0 } if",
-        "dup 1 gt { pop 1 } if",
-    ])
-    return "{ " + " ".join(parts) + " }"
 
 
 def _pikepdf_clone_resource_category(value):
@@ -4180,20 +4204,33 @@ def remove_temp_folder(max_retries=5, delay=1):
             time.sleep(delay)
 
 
-def _cleanup_temp_workspace_background():
-    """Recover stale temporary artifacts without blocking application startup.
 
-    The previous workspace is renamed out of the active path first. That makes the cleanup
-    independent from the GUI: the application gets a fresh temp directory immediately while
-    the old directory is removed by a daemon thread. If the atomic rename is unavailable,
-    a best-effort contents cleanup is used without retry sleeps.
-    """
+
+def _remove_detached_temp_workspace(path):
+    """Remove a previously detached temp workspace without touching the active one."""
     try:
-        active = os.path.abspath(TEMP_FOLDER)
-        parent = os.path.dirname(active) or os.getcwd()
-        os.makedirs(parent, exist_ok=True)
+        if os.path.islink(path) or not os.path.isdir(path):
+            if os.path.lexists(path):
+                os.remove(path)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
 
-        if not os.path.exists(active):
+
+def _start_background_temp_cleanup():
+    """Prepare a clean temp directory quickly and delete the previous one in background.
+
+    Renaming the old workspace is normally an O(1) operation. A fresh active ``temp/``
+    directory is ready before the main window can start a workflow; large stale contents
+    are removed separately on a daemon thread. If the filesystem refuses the rename (for
+    example, a locked file on Windows), preserve the old safe cleanup behavior as fallback.
+    """
+    active = os.path.abspath(TEMP_FOLDER)
+    parent = os.path.dirname(active) or os.getcwd()
+    try:
+        os.makedirs(parent, exist_ok=True)
+        if not os.path.lexists(active):
             os.makedirs(active, exist_ok=True)
             return
 
@@ -4204,40 +4241,33 @@ def _cleanup_temp_workspace_background():
         try:
             os.replace(active, stale)
         except OSError:
-            # Cross-platform fallback: remove only current entries, never sleep/retry here.
-            try:
-                for entry in os.scandir(active):
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            shutil.rmtree(entry.path, ignore_errors=True)
-                        else:
-                            os.remove(entry.path)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # Keep startup correctness if a locked workspace cannot be atomically detached.
+            remove_temp_folder(max_retries=3, delay=0.15)
             os.makedirs(active, exist_ok=True)
             return
 
-        os.makedirs(active, exist_ok=True)
         try:
-            shutil.rmtree(stale, ignore_errors=True)
+            os.makedirs(active, exist_ok=True)
         except Exception:
-            pass
+            # Restore the previous path if creating its replacement unexpectedly fails.
+            try:
+                if not os.path.lexists(active):
+                    os.replace(stale, active)
+            except Exception:
+                pass
+            raise
+
+        threading.Thread(
+            target=_remove_detached_temp_workspace,
+            args=(stale,),
+            name="MergerzTempCleanup",
+            daemon=True,
+        ).start()
     except Exception:
         try:
             os.makedirs(TEMP_FOLDER, exist_ok=True)
         except Exception:
             pass
-
-
-def _start_background_temp_cleanup():
-    """Start startup temp recovery without holding up the Qt event loop."""
-    threading.Thread(
-        target=_cleanup_temp_workspace_background,
-        name="MergerzTempCleanup",
-        daemon=True,
-    ).start()
 
 
 def unique_filename(base, ext, folder):
@@ -4930,59 +4960,6 @@ def _append_display_stretched_page(doc_out, doc_in, page_num, target_ratio=16 / 
         keep_proportion=False, rotate=placement_rotation)
 
 
-def _process_stretch_range_with_ratios(input_pdf_path, start_page, end_page, output_path,
-                                         processed_pages_ref, processed_pages_lock,
-                                         target_ratios=None):
-    """Build a page range using per-page target ratios (None means copy unchanged)."""
-    temp_output = output_path + ".partial.pdf"
-    doc_in = None
-    doc_out = None
-    try:
-        if os.path.exists(temp_output):
-            os.remove(temp_output)
-        doc_in = fitz.open(input_pdf_path)
-        doc_out = fitz.open()
-        for page_num in range(start_page, end_page + 1):
-            ratio = None
-            if target_ratios is None:
-                ratio = 16 / 9
-            else:
-                local_index = page_num - start_page
-                if 0 <= local_index < len(target_ratios):
-                    ratio = target_ratios[local_index]
-            if ratio is None:
-                doc_out.insert_pdf(doc_in, from_page=page_num, to_page=page_num)
-            else:
-                _append_display_stretched_page(
-                    doc_out, doc_in, page_num, target_ratio=ratio)
-            if processed_pages_ref is not None and processed_pages_lock is not None:
-                with processed_pages_lock:
-                    processed_pages_ref.value += 1
-        doc_in.close()
-        doc_in = None
-        doc_out.save(temp_output)
-        doc_out.close()
-        doc_out = None
-        os.replace(temp_output, output_path)
-    except Exception:
-        try:
-            if doc_in is not None:
-                doc_in.close()
-        except Exception:
-            pass
-        try:
-            if doc_out is not None:
-                doc_out.close()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
-            if os.path.exists(output_path):
-                os.remove(output_path)
-        except Exception:
-            pass
-        raise
 
 
 def _stretch_pdf_with_ratios_in_place(pdf_path, target_ratios, progress=None):
@@ -5236,16 +5213,24 @@ def _stretch_single_pdf_to_16_9(temp_path, progress_label=None):
     doc_out = fitz.open()
     stretched = temp_path + ".stretched.pdf"
     try:
-        last_progress = 0.0
-        for page_num in range(total_pages):
-            _append_display_stretched_page(doc_out, doc_in, page_num)
-            if progress_label:
-                now = time.monotonic()
-                done = page_num + 1
-                if done == total_pages or now - last_progress >= 0.2:
-                    update_progress(done, max(1, total_pages), progress_label)
-                    last_progress = now
-        doc_out.save(stretched)
+        try:
+            last_progress = 0.0
+            for page_num in range(total_pages):
+                _append_display_stretched_page(doc_out, doc_in, page_num)
+                if progress_label:
+                    now = time.monotonic()
+                    done = page_num + 1
+                    if done == total_pages or now - last_progress >= 0.2:
+                        update_progress(done, max(1, total_pages), progress_label)
+                        last_progress = now
+            doc_out.save(stretched)
+        finally:
+            # Windows refuses to replace a PDF while PyMuPDF still has the
+            # destination open. Close both documents before the atomic swap.
+            try:
+                doc_in.close()
+            finally:
+                doc_out.close()
         os.replace(stretched, temp_path)
     except Exception:
         try:
@@ -5254,9 +5239,6 @@ def _stretch_single_pdf_to_16_9(temp_path, progress_label=None):
         except Exception:
             pass
         raise
-    finally:
-        doc_in.close()
-        doc_out.close()
 
 
 def stretch_merged_pdf_to_16_9(
@@ -6223,17 +6205,6 @@ def _optimizer_iter_page_resource_dicts(pdf):
             yield from _optimizer_iter_resource_dicts_from_resources(
                 resources, seen_forms=seen_forms, seen_resources=seen_resources)
 
-def _optimizer_collect_resource_objects(pdf):
-    result = {}
-    for category, resource_dict in _optimizer_iter_page_resource_dicts(pdf):
-        for name, obj in list(resource_dict.items()):
-            try:
-                og = _optimizer_objgen(obj)
-                if og != (0, 0):
-                    result[og] = obj
-            except Exception:
-                pass
-    return result
 
 def _optimizer_collect_image_objects(pdf):
     images = {}
@@ -8990,7 +8961,6 @@ PLUGIN_MANIFEST_VERSION = 2
 OCR_PLUGIN_ID = "paddleocr"
 OCR_PLUGIN_VERSION = "2.0"
 OCR_PYTHON_MIN = (3, 10)
-OCR_PYTHON_MAX = (3, 14)
 # Native PaddleOCR/ONNX inference is isolated in a child process. This watchdog prevents
 # pathological/native stalls from waiting forever while still allowing very slow CPU OCR.
 OCR_INFERENCE_TIMEOUT_SECONDS = 300
@@ -9005,63 +8975,20 @@ LIBREOFFICE_PLUGIN_ID = "libreoffice"
 LIBREOFFICE_PLUGIN_MANIFEST_VERSION = 1
 LIBREOFFICE_DOWNLOAD_ROOT = "https://download.documentfoundation.org/libreoffice/stable"
 
-_PLUGIN_RUNNER_SOURCE = '#!/usr/bin/env python3\nimport argparse\nimport contextlib\nimport importlib.metadata\nimport inspect\nimport json\nimport os\nimport re\nimport sys\nimport tempfile\nimport time\nimport traceback\nimport types\nfrom pathlib import Path\n\nPLUGIN_ROOT = Path(__file__).resolve().parent\nMODELS = PLUGIN_ROOT / "models"\nos.environ.setdefault("PADDLE_HOME", str(MODELS / "paddle"))\nos.environ.setdefault("PADDLEX_HOME", str(MODELS / "paddlex"))\nos.environ.setdefault("XDG_CACHE_HOME", str(MODELS / "cache"))\nos.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")\nos.environ.setdefault("PYTHONUNBUFFERED", "1")\n\n# Automatic OCR is intentionally not model-hardcoded. PaddleOCR itself owns the default\n# model recommendation; discovery asks the installed package\'s resolver for the same default\n# pair used when no language/model is explicitly supplied.\n\n\ndef emit_log(message):\n    sys.stderr.write(str(message).rstrip() + "\\n")\n    sys.stderr.flush()\n\n\n@contextlib.contextmanager\ndef native_quiet():\n    saved_out = saved_err = devnull = None\n    try:\n        sys.stdout.flush(); sys.stderr.flush()\n    except Exception:\n        pass\n    try:\n        saved_out = os.dup(1); saved_err = os.dup(2)\n        devnull = os.open(os.devnull, os.O_WRONLY)\n        os.dup2(devnull, 1); os.dup2(devnull, 2)\n        yield\n    finally:\n        try:\n            sys.stdout.flush(); sys.stderr.flush()\n        except Exception:\n            pass\n        for fd, target in ((saved_out, 1), (saved_err, 2)):\n            try:\n                if fd is not None: os.dup2(fd, target)\n            except Exception:\n                pass\n        for fd in (devnull, saved_out, saved_err):\n            try:\n                if fd is not None: os.close(fd)\n            except Exception:\n                pass\n\n\ndef _plain(value):\n    try:\n        if hasattr(value, "tolist"):\n            return value.tolist()\n    except Exception:\n        pass\n    return value\n\n\ndef _result_dict(item):\n    if isinstance(item, dict):\n        return item\n    try:\n        raw = item.json\n        raw = raw() if callable(raw) else raw\n        if isinstance(raw, str): raw = json.loads(raw)\n        if isinstance(raw, dict): return raw\n    except Exception:\n        pass\n    try:\n        raw = vars(item)\n        if isinstance(raw, dict): return raw\n    except Exception:\n        pass\n    raise RuntimeError("PaddleOCR returned an unsupported result object.")\n\n\ndef _normalize_result(item):\n    data = _result_dict(item)\n    result = data.get("res")\n    if not isinstance(result, dict): result = data\n    texts = _plain(result.get("rec_texts", [])) or []\n    scores = _plain(result.get("rec_scores", [])) or []\n    boxes = _plain(result.get("rec_boxes", [])) or []\n    out = []\n    for i, text in enumerate(texts):\n        if text is None or not str(text).strip() or i >= len(boxes):\n            continue\n        try:\n            x0, y0, x1, y1 = [float(v) for v in list(boxes[i])[:4]]\n        except Exception:\n            continue\n        try:\n            conf = float(scores[i]) if i < len(scores) else 0.0\n        except Exception:\n            conf = 0.0\n        out.append({"px": [min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)],\n                    "text": str(text), "conf": conf})\n    return out\n\n\ndef _get_ort_runtime(prefer_gpu):\n    import onnxruntime as ort\n    available = list(ort.get_available_providers())\n    cuda_available = "CUDAExecutionProvider" in available\n    if prefer_gpu and cuda_available:\n        try:\n            preload = getattr(ort, "preload_dlls", None)\n            if callable(preload):\n                try: preload()\n                except Exception as exc:\n                    emit_log(f"ONNX Runtime CUDA DLL preload warning: {type(exc).__name__}: {exc}")\n        except Exception:\n            pass\n        return ort, ["CUDAExecutionProvider", "CPUExecutionProvider"], "GPU"\n    return ort, ["CPUExecutionProvider"], "CPU"\n\n\ndef _discover_default_ocr_model(resolver_fn=None):\n    """Resolve PaddleOCR\'s own default OCR detector/recognizer pair without initializing an engine.\n\n    Passing (None, None) to PaddleOCR\'s resolver mirrors the package\'s normal default\n    construction path. This deliberately avoids copying PaddleOCR\'s model/version mapping\n    into the application, so a future PaddleOCR release can change its recommended default\n    without requiring a Mergerz code update.\n    """\n    if resolver_fn is None:\n        from paddleocr import PaddleOCR\n        resolver = object.__new__(PaddleOCR)\n        resolver_fn = getattr(resolver, "_get_ocr_model_names", None)\n    if not callable(resolver_fn):\n        raise RuntimeError("Installed PaddleOCR does not expose its OCR model resolver.")\n\n    det, rec = resolver_fn(None, None)\n    det = str(det or "").strip()\n    rec = str(rec or "").strip()\n    if not det or not rec:\n        raise RuntimeError("Installed PaddleOCR did not expose a default OCR detector/recognizer pair.")\n    version = _ocr_version_token(det) or _ocr_version_token(rec)\n    if not version:\n        raise RuntimeError(\n            f"PaddleOCR default OCR models do not expose a recognizable OCR version: detection={det}, recognition={rec}."\n        )\n    return {\n        "ocr_version": version,\n        "detection_model": det,\n        "recognition_model": rec,\n        "onnxruntime_supported": _model_pair_supports_onnx(det, rec),\n    }\n\n\ndef _model_has_tag(model_name, tag):\n    """Match a concrete model variant token without knowing any upstream model names."""\n    tokens = [\n        part for part in re.split(r"[_\\-\\s]+", str(model_name or "").strip().lower())\n        if part\n    ]\n    return str(tag or "").strip().lower() in tokens\n\n\ndef _select_automatic_model(recommended_model, automatic_pairs):\n    """Prefer a dynamically discovered small pair, otherwise preserve PaddleOCR\'s default."""\n    recommended = dict(recommended_model or {})\n    pairs = [\n        dict(pair) for pair in (automatic_pairs or [])\n        if isinstance(pair, dict) and pair.get("onnxruntime_supported")\n    ]\n\n    # The automatic language mode is already restricted to pairs that are valid across\n    # its dynamically discovered language set. Prefer the lightweight pair only when the\n    # detector and recognizer both explicitly expose the "small" variant token.\n    small_pairs = [\n        pair for pair in pairs\n        if _model_has_tag(pair.get("detection_model"), "small")\n        and _model_has_tag(pair.get("recognition_model"), "small")\n    ]\n    if small_pairs:\n        small_pairs.sort(key=lambda pair: (\n            str(pair.get("detection_model") or "").casefold(),\n            str(pair.get("recognition_model") or "").casefold(),\n        ))\n        return small_pairs[0]\n\n    # No small pair was discovered: preserve the existing PaddleOCR-default mechanism.\n    if recommended.get("onnxruntime_supported"):\n        preferred_key = _pair_key(recommended)\n        for pair in pairs:\n            if _pair_key(pair) == preferred_key:\n                return pair\n        return recommended\n\n    raise RuntimeError(\n        "PaddleOCR\'s current default OCR pair is not ONNX-capable, and no dynamically discovered "\n        "small automatic pair is available."\n    )\n\n\ndef _automatic_model_config():\n    # Runtime Auto fallback uses the same dynamic capability discovery as installation and\n    # availability checks, ensuring it never contains an application-level model name.\n    return discover_capabilities()["automatic_model"]\n\n\ndef _model_supports_onnx(model_name):\n    model_name = str(model_name or "").strip()\n    if not model_name: return False\n    from paddlex.inference.utils import official_models\n    checker = getattr(official_models, "_is_supported_official_model_format", None)\n    if callable(checker):\n        return bool(checker(model_name, "onnx"))\n    resolver = getattr(official_models, "_resolve_download_model_names", None)\n    if callable(resolver):\n        try:\n            resolver(model_name, ("onnx",)); return True\n        except Exception as exc:\n            if isinstance(exc, ValueError) and "does not provide" in str(exc): return False\n            raise\n    supported = getattr(official_models, "ONNX_SUPPORTED_MODELS", None)\n    if isinstance(supported, (set, frozenset, list, tuple)):\n        return model_name in supported\n    raise RuntimeError("Installed PaddleX does not expose a way to determine official ONNX model support.")\n\n\ndef _model_pair_supports_onnx(det_name, rec_name):\n    return _model_supports_onnx(det_name) and _model_supports_onnx(rec_name)\n\n\ndef _onnx_supported_model_names():\n    from paddlex.inference.utils import official_models\n    supported = getattr(official_models, "ONNX_SUPPORTED_MODELS", None)\n    if isinstance(supported, (set, frozenset, list, tuple)):\n        return {str(name).strip() for name in supported if str(name).strip()}\n    # Older/newer PaddleX revisions may not expose the set under the same public-ish name.\n    # Fall back to the formats supported by the official resolver without naming model versions.\n    candidates = set()\n    for attr in ("OCR_MODELS", "MODEL_LIST", "ALL_MODELS"):\n        value = getattr(official_models, attr, None)\n        if isinstance(value, (set, frozenset, list, tuple)):\n            for name in value:\n                name = str(name).strip()\n                if name:\n                    try:\n                        if _model_supports_onnx(name): candidates.add(name)\n                    except Exception:\n                        pass\n    return candidates\n\n\ndef _ocr_version_token(model_name):\n    m = re.search(r"(PP-OCRv\\d+)", str(model_name or ""), re.I)\n    return m.group(1) if m else None\n\n\ndef _model_prefix_before_ocr_version(model_name):\n    m = re.search(r"PP-OCRv\\d+", str(model_name or ""), re.I)\n    if not m: return ""\n    return str(model_name)[:m.start()].strip("_- ").lower()\n\n\ndef _pair_key(pair):\n    return (str(pair.get("detection_model") or ""), str(pair.get("recognition_model") or ""))\n\n\ndef _model_variant_token(model_name):\n    """Return the concrete detector/recognizer variant token when the name exposes one."""\n    name = str(model_name or "").strip()\n    lower = name.lower()\n    for suffix in ("_det", "_rec"):\n        if lower.endswith(suffix):\n            stem = name[:-len(suffix)].rstrip("_-")\n            if "_" in stem:\n                token = stem.rsplit("_", 1)[-1].strip().lower()\n                if token:\n                    return token\n    return ""\n\n\ndef _recognizer_is_for_language(model_name, language, default_rec):\n    """Keep recognizers in the language family selected by PaddleOCR\'s resolver.\n\n    A generic recognizer (no prefix before PP-OCRvN) is valid for the generic language\n    families. A prefixed recognizer is kept only when its prefix is the resolver\'s\n    selected prefix or the exact installed PaddleOCR language code.\n    """\n    prefix = _model_prefix_before_ocr_version(model_name)\n    default_prefix = _model_prefix_before_ocr_version(default_rec)\n    language = str(language or "").strip().lower()\n    if not prefix:\n        return not default_prefix\n    if prefix == default_prefix:\n        return True\n    return prefix == language\n\n\ndef _candidate_pairs_for_language_version(language, version, default_det, default_rec, registry):\n    """Enumerate concrete, ONNX-runnable detector/recognizer pairs for a language/version.\n\n    The installed PaddleOCR resolver identifies the language family. The installed PaddleX\n    ONNX registry supplies concrete siblings. Detector/recognizer variants are paired by their\n    dynamically extracted variant token (e.g. medium/medium or mobile/mobile), preventing\n    arbitrary cross-variant combinations without hardcoding any model/version names.\n    """\n    token = _ocr_version_token(default_det) or _ocr_version_token(default_rec)\n    if not token: return []\n\n    dets = sorted({\n        n for n in registry\n        if _ocr_version_token(n) == token and n.lower().endswith("_det")\n    }, key=str.casefold)\n    recs = sorted({\n        n for n in registry\n        if _ocr_version_token(n) == token and n.lower().endswith("_rec")\n        and _recognizer_is_for_language(n, language, default_rec)\n    }, key=str.casefold)\n\n    if default_det in registry and default_det not in dets:\n        dets.append(default_det)\n    if default_rec in registry and default_rec not in recs:\n        recs.append(default_rec)\n\n    pairs = []\n    seen = set()\n    for det in dets:\n        det_variant = _model_variant_token(det)\n        compatible_recs = []\n        for rec in recs:\n            rec_variant = _model_variant_token(rec)\n            if det_variant and rec_variant and det_variant != rec_variant:\n                continue\n            compatible_recs.append(rec)\n        if not compatible_recs:\n            compatible_recs = [default_rec] if default_rec in recs else []\n        for rec in compatible_recs:\n            if not _model_supports_onnx(det) or not _model_supports_onnx(rec):\n                continue\n            pair = {\n                "ocr_version": version,\n                "detection_model": det,\n                "recognition_model": rec,\n                "onnxruntime_supported": True,\n            }\n            key = _pair_key(pair)\n            if key in seen:\n                continue\n            seen.add(key)\n            pairs.append(pair)\n\n    default_pair = {\n        "ocr_version": version,\n        "detection_model": default_det,\n        "recognition_model": default_rec,\n        "onnxruntime_supported": _model_pair_supports_onnx(default_det, default_rec),\n    }\n    if default_pair["onnxruntime_supported"] and _pair_key(default_pair) not in seen:\n        pairs.insert(0, default_pair)\n    return pairs\n\ndef _language_candidates_from_pipeline(ocr_module):\n    candidates = set()\n    for attr, value in vars(ocr_module).items():\n        if not (attr.endswith("_LANGS") or attr == "SPECIFIC_LANGS"): continue\n        if not isinstance(value, (list, tuple, set, frozenset)): continue\n        try: candidates.update(str(x).strip() for x in value if str(x).strip())\n        except Exception: pass\n    return candidates\n\n\ndef _collect_ocr_version_candidates(ocr_module, paddle_ocr_cls):\n    found = set()\n    pattern = re.compile(r"\\bPP-OCRv\\d+\\b", re.I)\n    def visit(value, depth=0):\n        if depth > 8: return\n        if isinstance(value, str):\n            found.update(m.upper().replace("PP-OCRV", "PP-OCRv") for m in pattern.findall(value)); return\n        if isinstance(value, types.CodeType):\n            for const in value.co_consts: visit(const, depth+1); return\n        if isinstance(value, (list, tuple, set, frozenset)):\n            for item in value: visit(item, depth+1)\n    for obj in (getattr(paddle_ocr_cls, "_get_ocr_model_names", None), getattr(paddle_ocr_cls, "__init__", None)):\n        code = getattr(obj, "__code__", None)\n        if code is not None: visit(code)\n    for owner in (ocr_module, paddle_ocr_cls):\n        for name, value in vars(owner).items():\n            if name.startswith("__"): continue\n            if isinstance(value, (str, list, tuple, set, frozenset)): visit(value)\n    return sorted({re.sub(r"(?i)^PP-OCRV", "PP-OCRv", x) for x in found}, key=lambda x: (int(re.search(r"(\\d+)$", x).group(1)) if re.search(r"(\\d+)$", x) else -1, x.casefold()), reverse=True)\n\n\ndef discover_capabilities():\n    from paddleocr._pipelines import ocr as ocr_module\n    from paddleocr import PaddleOCR\n    version = importlib.metadata.version("paddleocr")\n    resolver = object.__new__(PaddleOCR)\n    resolver_fn = getattr(resolver, "_get_ocr_model_names", None)\n    if not callable(resolver_fn):\n        raise RuntimeError("Installed PaddleOCR does not expose its OCR model resolver.")\n    language_candidates = _language_candidates_from_pipeline(ocr_module)\n    model_versions = _collect_ocr_version_candidates(ocr_module, PaddleOCR)\n    if not model_versions:\n        raise RuntimeError("Could not discover any selectable OCR model versions from the installed PaddleOCR package.")\n    registry = _onnx_supported_model_names()\n    language_models = {}\n    model_meta = {mid:{"id":mid,"languages":set(),"detection_models":set(),"recognition_models":set(),"onnxruntime_supported":False} for mid in model_versions}\n\n    for code in sorted(language_candidates):\n        code = str(code).strip().lower()\n        if not code or code in {"auto", "multilingual", "all"}: continue\n        per_version = {}\n        for model_id in model_versions:\n            try: det, rec = resolver_fn(code, model_id)\n            except Exception: continue\n            if not det or not rec: continue\n            pairs = _candidate_pairs_for_language_version(code, model_id, str(det), str(rec), registry)\n            if not pairs: continue\n            per_version[model_id] = {"ocr_version": model_id, "pairs": pairs}\n            meta = model_meta.get(model_id)\n            if meta:\n                meta["languages"].add(code)\n                for pair in pairs:\n                    meta["detection_models"].add(pair["detection_model"])\n                    meta["recognition_models"].add(pair["recognition_model"])\n                    meta["onnxruntime_supported"] = True\n        if per_version: language_models[code] = {"models": per_version}\n\n    languages = []\n    for code in sorted(language_models): languages.append({"code": code, "name": code})\n    models = []\n    for model_id, meta in model_meta.items():\n        if not meta["languages"]: continue\n        models.append({"id":model_id,\n                       "languages":sorted(meta["languages"]),\n                       "detection_models":sorted(meta["detection_models"], key=str.casefold),\n                       "recognition_models":sorted(meta["recognition_models"], key=str.casefold),\n                       "onnxruntime_supported":bool(meta["onnxruntime_supported"])})\n    models.sort(key=lambda item:(-int(re.search(r"(\\d+)$", item["id"]).group(1)) if re.search(r"(\\d+)$", item["id"]) else 0, item["id"].casefold()))\n\n    # PaddleOCR\'s own resolver establishes the current recommended OCR version/family.\n    # Mergerz then prefers a dynamically discovered small pair inside that same automatic\n    # capability set rather than choosing a larger model simply because it is the upstream default.\n    recommended_default = _discover_default_ocr_model(resolver_fn=resolver_fn)\n    automatic_version = str(recommended_default.get("ocr_version") or "").strip()\n    automatic_language_codes = set()\n    for meta in model_meta.values():\n        if meta.get("id") == automatic_version:\n            automatic_language_codes.update(meta.get("languages") or [])\n    if not automatic_language_codes:\n        automatic_language_codes = {code for code, info in language_models.items()\n                                     if automatic_version in (info.get("models") or {})}\n\n    common_keys = None\n    pair_by_key = {}\n    for code in sorted(automatic_language_codes):\n        vinfo = ((language_models.get(code) or {}).get("models") or {}).get(automatic_version) or {}\n        pairs = [p for p in (vinfo.get("pairs") or []) if p.get("onnxruntime_supported")]\n        keys = {_pair_key(p) for p in pairs}\n        for p in pairs:\n            pair_by_key[_pair_key(p)] = p\n        common_keys = keys if common_keys is None else (common_keys & keys)\n    if common_keys is None:\n        common_keys = set()\n    automatic_pairs = [pair_by_key[key] for key in sorted(common_keys)]\n\n    automatic = _select_automatic_model(recommended_default, automatic_pairs)\n    if _pair_key(automatic) not in {_pair_key(p) for p in automatic_pairs}:\n        automatic_pairs.insert(0, automatic)\n\n    return {"ok":True,"paddleocr_version":version,"languages":languages,"models":models,\n            "language_models":language_models,\n            "paddleocr_default_model":dict(recommended_default),\n            "automatic_model":automatic,\n            "automatic_pairs":automatic_pairs}\n\n\ndef _resolve_model_config(language, model_selection):\n    from paddleocr import PaddleOCR\n    language = (language or "auto").strip().lower() or "auto"\n    if language in ("auto", "multilingual", "all"):\n        return _automatic_model_config()\n    if not model_selection or str(model_selection).strip().lower() == "auto":\n        raise RuntimeError("A concrete OCR model pair is required for a specific language.")\n    version = str(model_selection).strip()\n    resolver = object.__new__(PaddleOCR)\n    resolver_fn = getattr(resolver, "_get_ocr_model_names", None)\n    if not callable(resolver_fn):\n        raise RuntimeError("Installed PaddleOCR does not expose its OCR model resolver.")\n    det, rec = resolver_fn(language, version)\n    if not det or not rec:\n        raise RuntimeError(f"PaddleOCR does not provide model \'{version}\' for language \'{language}\'.")\n    return {"ocr_version":version,"detection_model":str(det),"recognition_model":str(rec),\n            "onnxruntime_supported":_model_pair_supports_onnx(det,rec)}\n\n\ndef _make_kwargs(language, model_config, providers, device, detection_limit=None):\n    from paddleocr import PaddleOCR\n    config = dict(model_config or {})\n    det = str(config.get("detection_model") or "").strip()\n    rec = str(config.get("recognition_model") or "").strip()\n    if not det or not rec:\n        raise RuntimeError(f"No concrete OCR detection/recognition model was supplied for language \'{language}\'.")\n    ort_config = {"providers":providers,"log_severity_level":3}\n    kwargs = {\n        "device":"gpu:0" if device == "GPU" else "cpu",\n        "engine":"onnxruntime",\n        "engine_config":{"onnxruntime":ort_config},\n        "use_doc_orientation_classify":False,\n        "use_doc_unwarping":False,\n        "use_textline_orientation":False,\n        # Crucially: do not pass lang/ocr_version here. PaddleOCR otherwise resolves\n        # its own pair and can overwrite explicit model-name selections.\n        "text_detection_model_name":det,\n        "text_recognition_model_name":rec,\n    }\n    if detection_limit is not None:\n        kwargs["text_det_limit_side_len"] = int(detection_limit)\n        kwargs["text_det_limit_type"] = "max"\n    return PaddleOCR, kwargs\n\n\ndef build_engine(language, model_config=None, prefer_gpu=False, require_gpu=False, detection_limit=None):\n    ort, providers, selected_device = _get_ort_runtime(bool(prefer_gpu))\n    cuda_available = "CUDAExecutionProvider" in ort.get_available_providers()\n    if require_gpu and not cuda_available:\n        raise RuntimeError("NVIDIA CUDA execution support is not available in this OCR environment.")\n    if model_config is None:\n        model_config = _resolve_model_config(language, "pipeline_auto" if str(language).lower()=="auto" else None)\n    runtime_config = dict(model_config or {})\n    PaddleOCR, kwargs = _make_kwargs(language, runtime_config, providers, selected_device, detection_limit=detection_limit)\n    try:\n        with native_quiet(): engine = PaddleOCR(**kwargs)\n        return engine, selected_device, runtime_config\n    except Exception as first_exc:\n        text = str(first_exc)\n        if "does not provide" in text and "onnx" in text.lower(): raise\n        if os.environ.get("PADDLE_PDX_MODEL_SOURCE") != "BOS":\n            os.environ["PADDLE_PDX_MODEL_SOURCE"] = "BOS"\n            emit_log("Default PaddleOCR model source failed; retrying with BOS...")\n            try:\n                with native_quiet(): engine = PaddleOCR(**kwargs)\n                return engine, selected_device, runtime_config\n            except Exception:\n                pass\n        raise first_exc\n\n\ndef check_runtime():\n    import onnxruntime as ort\n    versions={"paddleocr":importlib.metadata.version("paddleocr"),"onnxruntime":ort.__version__}\n    available=list(ort.get_available_providers())\n    if "CPUExecutionProvider" not in available:\n        raise RuntimeError("ONNX Runtime CPU execution support is missing.")\n    return {"ok":True,"versions":versions,"providers":available,"gpu_available":"CUDAExecutionProvider" in available}\n\n\ndef verify(prefer_gpu=False, require_gpu=False):\n    import onnxruntime as ort\n    versions={"paddleocr":importlib.metadata.version("paddleocr"),"onnxruntime":ort.__version__,"Pillow":importlib.metadata.version("Pillow")}\n    emit_log("Imported PaddleOCR, ONNX Runtime and Pillow successfully.")\n    if require_gpu and "CUDAExecutionProvider" not in ort.get_available_providers():\n        raise RuntimeError("GPU verification was requested, but CUDAExecutionProvider is unavailable.")\n    emit_log("Initializing OCR engine for a real smoke test...")\n    automatic = _automatic_model_config()\n    engine, device, _ = build_engine("auto", automatic, prefer_gpu=prefer_gpu, require_gpu=require_gpu, detection_limit=None)\n    from PIL import Image, ImageDraw, ImageFont\n    with tempfile.TemporaryDirectory(prefix="mergerz_ocr_verify_") as td:\n        path=Path(td)/"verify.png"\n        img=Image.new("RGB",(1600,500),"white"); draw=ImageDraw.Draw(img)\n        try: font=ImageFont.truetype("DejaVuSans.ttf",96)\n        except Exception: font=ImageFont.load_default()\n        draw.text((80,160),"Mergerz OCR 123",fill="black",font=font); img.save(path)\n        emit_log(f"Running OCR smoke test on {device}...")\n        started=time.monotonic()\n        with native_quiet(): raw=list(engine.predict(input=str(path)))\n        emit_log(f"OCR smoke inference finished in {time.monotonic()-started:.1f}s.")\n        if not raw: raise RuntimeError("OCR engine returned no result object during the smoke test.")\n        blocks=_normalize_result(raw[0])\n        if not blocks: raise RuntimeError("OCR smoke test completed, but no text regions were recognized.")\n        emit_log(f"OCR smoke test returned {len(blocks)} recognized region(s).")\n    return {"versions":versions,"device":device}\n\n\ndef _config_key(language, model_config, detection_limit=None):\n    c=model_config or {}\n    return (str(language or "auto").lower(),str(c.get("ocr_version") or ""),str(c.get("detection_model") or ""),str(c.get("recognition_model") or ""),detection_limit)\n\n\ndef serve(prefer_gpu=False):\n    engine_cache={}; device_cache={}; config_cache={}\n    emit_log("OCR plugin runner ready; GPU preference=" + ("enabled" if prefer_gpu else "disabled"))\n    for line in sys.stdin:\n        line=line.strip()\n        if not line: continue\n        req=None\n        try:\n            req=json.loads(line); rid=req.get("id"); language=req.get("language") or "auto"; image_path=str(req.get("image_path") or "")\n            if not image_path or not os.path.isfile(image_path): raise RuntimeError("OCR input image does not exist.")\n            model_config=req.get("model_config")\n            if not isinstance(model_config,dict):\n                model_config=_resolve_model_config(language,req.get("model"))\n            detection_limit=req.get("detection_limit_px")\n            if detection_limit in (None,"","model_default"): detection_limit=None\n            else:\n                try: detection_limit=max(1,int(detection_limit))\n                except Exception: raise RuntimeError("OCR detection-size selection is invalid.")\n            key=_config_key(language,model_config,detection_limit)\n            if key not in engine_cache:\n                version=str(model_config.get("ocr_version") or "Automatic")\n                emit_log(f"Initializing OCR engine for language \'{language}\' using model \'{version}\'...")\n                engine,device,actual=build_engine(language,model_config=model_config,prefer_gpu=prefer_gpu,require_gpu=bool(prefer_gpu),detection_limit=detection_limit)\n                engine_cache[key]=engine; device_cache[key]=device; config_cache[key]=actual\n                emit_log(f"OCR model loaded: detection={actual.get(\'detection_model\')}, recognition={actual.get(\'recognition_model\')}")\n            actual=config_cache[key]\n            limit_text="model default" if detection_limit is None else f"{detection_limit}px"\n            emit_log(f"OCR inference started: model={actual.get(\'ocr_version\') or \'Automatic\'}; detection size={limit_text}")\n            started=time.monotonic()\n            with native_quiet(): raw=list(engine_cache[key].predict(input=image_path))\n            emit_log(f"OCR inference finished in {time.monotonic()-started:.1f}s.")\n            if len(raw)!=1: raise RuntimeError(f"PaddleOCR returned {len(raw)} result objects for one input image.")\n            blocks=_normalize_result(raw[0])\n            sys.stdout.write(json.dumps({"id":rid,"ok":True,"blocks":blocks,"device":device_cache[key],"model":actual},ensure_ascii=False)+"\\n"); sys.stdout.flush()\n        except Exception as exc:\n            emit_log(traceback.format_exc())\n            try:\n                sys.stdout.write(json.dumps({"id":req.get("id") if isinstance(req,dict) else None,"ok":False,"error":f"{type(exc).__name__}: {exc}"})+"\\n"); sys.stdout.flush()\n            except Exception: pass\n\n\ndef main():\n    ap=argparse.ArgumentParser(); ap.add_argument("--languages",action="store_true"); ap.add_argument("--capabilities",action="store_true"); ap.add_argument("--default-model",action="store_true"); ap.add_argument("--check",action="store_true"); ap.add_argument("--verify",action="store_true"); ap.add_argument("--serve",action="store_true"); ap.add_argument("--prefer-gpu",action="store_true"); ap.add_argument("--require-gpu",action="store_true")\n    args=ap.parse_args()\n    if args.default_model:\n        # This probe intentionally returns PaddleOCR\'s raw resolver result, not Mergerz\'s\n        # small-model automatic choice. The main app uses it to detect upstream default changes.\n        print(json.dumps({"ok":True,"paddleocr_default_model":_discover_default_ocr_model()},ensure_ascii=False)); return 0\n    if args.capabilities or args.languages:\n        print(json.dumps(discover_capabilities(),ensure_ascii=False)); return 0\n    if args.check:\n        print(json.dumps(check_runtime(),ensure_ascii=False)); return 0\n    if args.verify:\n        result=verify(prefer_gpu=args.prefer_gpu,require_gpu=args.require_gpu); print(json.dumps({"ok":True,**result})); return 0\n    if args.serve:\n        serve(prefer_gpu=args.prefer_gpu); return 0\n    raise SystemExit("Specify --capabilities, --check, --verify or --serve.")\n\nif __name__ == "__main__":\n    try: raise SystemExit(main())\n    except Exception: emit_log(traceback.format_exc()); raise\n'
-
-def _write_plugin_runner(root):
-    path = _ocr_runner_path(root)
-    os.makedirs(root, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(_PLUGIN_RUNNER_SOURCE)
-    try:
-        os.chmod(path, 0o755)
-    except Exception:
-        pass
+_PLUGIN_RUNNER_SOURCE = '#!/usr/bin/env python3\nimport argparse\nimport contextlib\nimport importlib.metadata\nimport inspect\nimport json\nimport os\nimport re\nimport sys\nimport tempfile\nimport time\nimport traceback\nimport types\nfrom pathlib import Path\n\nPLUGIN_ROOT = Path(__file__).resolve().parent\nMODELS = PLUGIN_ROOT / "models"\nos.environ.setdefault("PADDLE_HOME", str(MODELS / "paddle"))\nos.environ.setdefault("PADDLEX_HOME", str(MODELS / "paddlex"))\nos.environ.setdefault("XDG_CACHE_HOME", str(MODELS / "cache"))\nos.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")\nos.environ.setdefault("PYTHONUNBUFFERED", "1")\n\n# Automatic OCR is intentionally not model-hardcoded. PaddleOCR itself owns the default\n# model recommendation; discovery asks the installed package\'s resolver for the same default\n# pair used when no language/model is explicitly supplied.\n\n\ndef emit_log(message):\n    sys.stderr.write(str(message).rstrip() + "\\n")\n    sys.stderr.flush()\n\n\n@contextlib.contextmanager\ndef native_quiet():\n    saved_out = saved_err = devnull = None\n    try:\n        sys.stdout.flush(); sys.stderr.flush()\n    except Exception:\n        pass\n    try:\n        saved_out = os.dup(1); saved_err = os.dup(2)\n        devnull = os.open(os.devnull, os.O_WRONLY)\n        os.dup2(devnull, 1); os.dup2(devnull, 2)\n        yield\n    finally:\n        try:\n            sys.stdout.flush(); sys.stderr.flush()\n        except Exception:\n            pass\n        for fd, target in ((saved_out, 1), (saved_err, 2)):\n            try:\n                if fd is not None: os.dup2(fd, target)\n            except Exception:\n                pass\n        for fd in (devnull, saved_out, saved_err):\n            try:\n                if fd is not None: os.close(fd)\n            except Exception:\n                pass\n\n\ndef _plain(value):\n    try:\n        if hasattr(value, "tolist"):\n            return value.tolist()\n    except Exception:\n        pass\n    return value\n\n\ndef _result_dict(item):\n    if isinstance(item, dict):\n        return item\n    try:\n        raw = item.json\n        raw = raw() if callable(raw) else raw\n        if isinstance(raw, str): raw = json.loads(raw)\n        if isinstance(raw, dict): return raw\n    except Exception:\n        pass\n    try:\n        raw = vars(item)\n        if isinstance(raw, dict): return raw\n    except Exception:\n        pass\n    raise RuntimeError("PaddleOCR returned an unsupported result object.")\n\n\ndef _normalize_result(item):\n    data = _result_dict(item)\n    result = data.get("res")\n    if not isinstance(result, dict): result = data\n    texts = _plain(result.get("rec_texts", [])) or []\n    scores = _plain(result.get("rec_scores", [])) or []\n    boxes = _plain(result.get("rec_boxes", [])) or []\n    out = []\n    for i, text in enumerate(texts):\n        if text is None or not str(text).strip() or i >= len(boxes):\n            continue\n        try:\n            x0, y0, x1, y1 = [float(v) for v in list(boxes[i])[:4]]\n        except Exception:\n            continue\n        try:\n            conf = float(scores[i]) if i < len(scores) else 0.0\n        except Exception:\n            conf = 0.0\n        out.append({"px": [min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)],\n                    "text": str(text), "conf": conf})\n    return out\n\n\ndef _get_ort_runtime(prefer_gpu):\n    import onnxruntime as ort\n    available = list(ort.get_available_providers())\n    cuda_available = "CUDAExecutionProvider" in available\n    if prefer_gpu and cuda_available:\n        try:\n            preload = getattr(ort, "preload_dlls", None)\n            if callable(preload):\n                try: preload()\n                except Exception as exc:\n                    emit_log(f"ONNX Runtime CUDA DLL preload warning: {type(exc).__name__}: {exc}")\n        except Exception:\n            pass\n        return ort, ["CUDAExecutionProvider", "CPUExecutionProvider"], "GPU"\n    return ort, ["CPUExecutionProvider"], "CPU"\n\n\ndef _discover_default_ocr_model(resolver_fn=None):\n    """Resolve PaddleOCR\'s own default OCR detector/recognizer pair without initializing an engine.\n\n    Passing (None, None) to PaddleOCR\'s resolver mirrors the package\'s normal default\n    construction path. This deliberately avoids copying PaddleOCR\'s model/version mapping\n    into the application, so a future PaddleOCR release can change its recommended default\n    without requiring a Mergerz code update.\n    """\n    if resolver_fn is None:\n        from paddleocr import PaddleOCR\n        resolver = object.__new__(PaddleOCR)\n        resolver_fn = getattr(resolver, "_get_ocr_model_names", None)\n    if not callable(resolver_fn):\n        raise RuntimeError("Installed PaddleOCR does not expose its OCR model resolver.")\n\n    det, rec = resolver_fn(None, None)\n    det = str(det or "").strip()\n    rec = str(rec or "").strip()\n    if not det or not rec:\n        raise RuntimeError("Installed PaddleOCR did not expose a default OCR detector/recognizer pair.")\n    version = _ocr_version_token(det) or _ocr_version_token(rec)\n    if not version:\n        raise RuntimeError(\n            f"PaddleOCR default OCR models do not expose a recognizable OCR version: detection={det}, recognition={rec}."\n        )\n    return {\n        "ocr_version": version,\n        "detection_model": det,\n        "recognition_model": rec,\n        "onnxruntime_supported": _model_pair_supports_onnx(det, rec),\n    }\n\n\ndef _model_has_tag(model_name, tag):\n    """Match a concrete model variant token without knowing any upstream model names."""\n    tokens = [\n        part for part in re.split(r"[_\\-\\s]+", str(model_name or "").strip().lower())\n        if part\n    ]\n    return str(tag or "").strip().lower() in tokens\n\n\ndef _select_automatic_model(recommended_model, automatic_pairs):\n    """Prefer a dynamically discovered small pair, otherwise preserve PaddleOCR\'s default."""\n    recommended = dict(recommended_model or {})\n    pairs = [\n        dict(pair) for pair in (automatic_pairs or [])\n        if isinstance(pair, dict) and pair.get("onnxruntime_supported")\n    ]\n\n    # The automatic language mode is already restricted to pairs that are valid across\n    # its dynamically discovered language set. Prefer the lightweight pair only when the\n    # detector and recognizer both explicitly expose the "small" variant token.\n    small_pairs = [\n        pair for pair in pairs\n        if _model_has_tag(pair.get("detection_model"), "small")\n        and _model_has_tag(pair.get("recognition_model"), "small")\n    ]\n    if small_pairs:\n        small_pairs.sort(key=lambda pair: (\n            str(pair.get("detection_model") or "").casefold(),\n            str(pair.get("recognition_model") or "").casefold(),\n        ))\n        return small_pairs[0]\n\n    # No small pair was discovered: preserve the existing PaddleOCR-default mechanism.\n    if recommended.get("onnxruntime_supported"):\n        preferred_key = _pair_key(recommended)\n        for pair in pairs:\n            if _pair_key(pair) == preferred_key:\n                return pair\n        return recommended\n\n    raise RuntimeError(\n        "PaddleOCR\'s current default OCR pair is not ONNX-capable, and no dynamically discovered "\n        "small automatic pair is available."\n    )\n\n\ndef _automatic_model_config():\n    # Runtime Auto fallback uses the same dynamic capability discovery as installation and\n    # availability checks, ensuring it never contains an application-level model name.\n    return discover_capabilities()["automatic_model"]\n\n\ndef _model_supports_onnx(model_name):\n    model_name = str(model_name or "").strip()\n    if not model_name: return False\n    from paddlex.inference.utils import official_models\n    checker = getattr(official_models, "_is_supported_official_model_format", None)\n    if callable(checker):\n        return bool(checker(model_name, "onnx"))\n    resolver = getattr(official_models, "_resolve_download_model_names", None)\n    if callable(resolver):\n        try:\n            resolver(model_name, ("onnx",)); return True\n        except Exception as exc:\n            if isinstance(exc, ValueError) and "does not provide" in str(exc): return False\n            raise\n    supported = getattr(official_models, "ONNX_SUPPORTED_MODELS", None)\n    if isinstance(supported, (set, frozenset, list, tuple)):\n        return model_name in supported\n    raise RuntimeError("Installed PaddleX does not expose a way to determine official ONNX model support.")\n\n\ndef _model_pair_supports_onnx(det_name, rec_name):\n    return _model_supports_onnx(det_name) and _model_supports_onnx(rec_name)\n\n\ndef _onnx_supported_model_names():\n    from paddlex.inference.utils import official_models\n    supported = getattr(official_models, "ONNX_SUPPORTED_MODELS", None)\n    if isinstance(supported, (set, frozenset, list, tuple)):\n        return {str(name).strip() for name in supported if str(name).strip()}\n    # Older/newer PaddleX revisions may not expose the set under the same public-ish name.\n    # Fall back to the formats supported by the official resolver without naming model versions.\n    candidates = set()\n    for attr in ("OCR_MODELS", "MODEL_LIST", "ALL_MODELS"):\n        value = getattr(official_models, attr, None)\n        if isinstance(value, (set, frozenset, list, tuple)):\n            for name in value:\n                name = str(name).strip()\n                if name:\n                    try:\n                        if _model_supports_onnx(name): candidates.add(name)\n                    except Exception:\n                        pass\n    return candidates\n\n\ndef _ocr_version_token(model_name):\n    m = re.search(r"(PP-OCRv\\d+)", str(model_name or ""), re.I)\n    return m.group(1) if m else None\n\n\ndef _model_prefix_before_ocr_version(model_name):\n    m = re.search(r"PP-OCRv\\d+", str(model_name or ""), re.I)\n    if not m: return ""\n    return str(model_name)[:m.start()].strip("_- ").lower()\n\n\ndef _pair_key(pair):\n    return (str(pair.get("detection_model") or ""), str(pair.get("recognition_model") or ""))\n\n\ndef _model_variant_token(model_name):\n    """Return the concrete detector/recognizer variant token when the name exposes one."""\n    name = str(model_name or "").strip()\n    lower = name.lower()\n    for suffix in ("_det", "_rec"):\n        if lower.endswith(suffix):\n            stem = name[:-len(suffix)].rstrip("_-")\n            if "_" in stem:\n                token = stem.rsplit("_", 1)[-1].strip().lower()\n                if token:\n                    return token\n    return ""\n\n\ndef _recognizer_is_for_language(model_name, language, default_rec):\n    """Keep recognizers in the language family selected by PaddleOCR\'s resolver.\n\n    A generic recognizer (no prefix before PP-OCRvN) is valid for the generic language\n    families. A prefixed recognizer is kept only when its prefix is the resolver\'s\n    selected prefix or the exact installed PaddleOCR language code.\n    """\n    prefix = _model_prefix_before_ocr_version(model_name)\n    default_prefix = _model_prefix_before_ocr_version(default_rec)\n    language = str(language or "").strip().lower()\n    if not prefix:\n        return not default_prefix\n    if prefix == default_prefix:\n        return True\n    return prefix == language\n\n\ndef _candidate_pairs_for_language_version(language, version, default_det, default_rec, registry):\n    """Enumerate concrete, ONNX-runnable detector/recognizer pairs for a language/version.\n\n    The installed PaddleOCR resolver identifies the language family. The installed PaddleX\n    ONNX registry supplies concrete siblings. Detector/recognizer variants are paired by their\n    dynamically extracted variant token (e.g. medium/medium or mobile/mobile), preventing\n    arbitrary cross-variant combinations without hardcoding any model/version names.\n    """\n    token = _ocr_version_token(default_det) or _ocr_version_token(default_rec)\n    if not token: return []\n\n    dets = sorted({\n        n for n in registry\n        if _ocr_version_token(n) == token and n.lower().endswith("_det")\n    }, key=str.casefold)\n    recs = sorted({\n        n for n in registry\n        if _ocr_version_token(n) == token and n.lower().endswith("_rec")\n        and _recognizer_is_for_language(n, language, default_rec)\n    }, key=str.casefold)\n\n    if default_det in registry and default_det not in dets:\n        dets.append(default_det)\n    if default_rec in registry and default_rec not in recs:\n        recs.append(default_rec)\n\n    pairs = []\n    seen = set()\n    for det in dets:\n        det_variant = _model_variant_token(det)\n        compatible_recs = []\n        for rec in recs:\n            rec_variant = _model_variant_token(rec)\n            if det_variant and rec_variant and det_variant != rec_variant:\n                continue\n            compatible_recs.append(rec)\n        if not compatible_recs:\n            compatible_recs = [default_rec] if default_rec in recs else []\n        for rec in compatible_recs:\n            if not _model_supports_onnx(det) or not _model_supports_onnx(rec):\n                continue\n            pair = {\n                "ocr_version": version,\n                "detection_model": det,\n                "recognition_model": rec,\n                "onnxruntime_supported": True,\n            }\n            key = _pair_key(pair)\n            if key in seen:\n                continue\n            seen.add(key)\n            pairs.append(pair)\n\n    default_pair = {\n        "ocr_version": version,\n        "detection_model": default_det,\n        "recognition_model": default_rec,\n        "onnxruntime_supported": _model_pair_supports_onnx(default_det, default_rec),\n    }\n    if default_pair["onnxruntime_supported"] and _pair_key(default_pair) not in seen:\n        pairs.insert(0, default_pair)\n    return pairs\n\ndef _language_candidates_from_pipeline(ocr_module):\n    candidates = set()\n    for attr, value in vars(ocr_module).items():\n        if not (attr.endswith("_LANGS") or attr == "SPECIFIC_LANGS"): continue\n        if not isinstance(value, (list, tuple, set, frozenset)): continue\n        try: candidates.update(str(x).strip() for x in value if str(x).strip())\n        except Exception: pass\n    return candidates\n\n\ndef _collect_ocr_version_candidates(ocr_module, paddle_ocr_cls):\n    found = set()\n    pattern = re.compile(r"\\bPP-OCRv\\d+\\b", re.I)\n    def visit(value, depth=0):\n        if depth > 8: return\n        if isinstance(value, str):\n            found.update(m.upper().replace("PP-OCRV", "PP-OCRv") for m in pattern.findall(value)); return\n        if isinstance(value, types.CodeType):\n            for const in value.co_consts: visit(const, depth+1); return\n        if isinstance(value, (list, tuple, set, frozenset)):\n            for item in value: visit(item, depth+1)\n    for obj in (getattr(paddle_ocr_cls, "_get_ocr_model_names", None), getattr(paddle_ocr_cls, "__init__", None)):\n        code = getattr(obj, "__code__", None)\n        if code is not None: visit(code)\n    for owner in (ocr_module, paddle_ocr_cls):\n        for name, value in vars(owner).items():\n            if name.startswith("__"): continue\n            if isinstance(value, (str, list, tuple, set, frozenset)): visit(value)\n    return sorted({re.sub(r"(?i)^PP-OCRV", "PP-OCRv", x) for x in found}, key=lambda x: (int(re.search(r"(\\d+)$", x).group(1)) if re.search(r"(\\d+)$", x) else -1, x.casefold()), reverse=True)\n\n\ndef discover_capabilities():\n    from paddleocr._pipelines import ocr as ocr_module\n    from paddleocr import PaddleOCR\n    version = importlib.metadata.version("paddleocr")\n    resolver = object.__new__(PaddleOCR)\n    resolver_fn = getattr(resolver, "_get_ocr_model_names", None)\n    if not callable(resolver_fn):\n        raise RuntimeError("Installed PaddleOCR does not expose its OCR model resolver.")\n    language_candidates = _language_candidates_from_pipeline(ocr_module)\n    model_versions = _collect_ocr_version_candidates(ocr_module, PaddleOCR)\n    if not model_versions:\n        raise RuntimeError("Could not discover any selectable OCR model versions from the installed PaddleOCR package.")\n    registry = _onnx_supported_model_names()\n    language_models = {}\n    model_meta = {mid:{"id":mid,"languages":set(),"detection_models":set(),"recognition_models":set(),"onnxruntime_supported":False} for mid in model_versions}\n\n    for code in sorted(language_candidates):\n        code = str(code).strip().lower()\n        if not code or code in {"auto", "multilingual", "all"}: continue\n        per_version = {}\n        for model_id in model_versions:\n            try: det, rec = resolver_fn(code, model_id)\n            except Exception: continue\n            if not det or not rec: continue\n            pairs = _candidate_pairs_for_language_version(code, model_id, str(det), str(rec), registry)\n            if not pairs: continue\n            per_version[model_id] = {"ocr_version": model_id, "pairs": pairs}\n            meta = model_meta.get(model_id)\n            if meta:\n                meta["languages"].add(code)\n                for pair in pairs:\n                    meta["detection_models"].add(pair["detection_model"])\n                    meta["recognition_models"].add(pair["recognition_model"])\n                    meta["onnxruntime_supported"] = True\n        if per_version: language_models[code] = {"models": per_version}\n\n    languages = []\n    for code in sorted(language_models): languages.append({"code": code, "name": code})\n    models = []\n    for model_id, meta in model_meta.items():\n        if not meta["languages"]: continue\n        models.append({"id":model_id,\n                       "languages":sorted(meta["languages"]),\n                       "detection_models":sorted(meta["detection_models"], key=str.casefold),\n                       "recognition_models":sorted(meta["recognition_models"], key=str.casefold),\n                       "onnxruntime_supported":bool(meta["onnxruntime_supported"])})\n    models.sort(key=lambda item:(-int(re.search(r"(\\d+)$", item["id"]).group(1)) if re.search(r"(\\d+)$", item["id"]) else 0, item["id"].casefold()))\n\n    # PaddleOCR\'s own resolver establishes the current recommended OCR version/family.\n    # Mergerz then prefers a dynamically discovered small pair inside that same automatic\n    # capability set rather than choosing a larger model simply because it is the upstream default.\n    recommended_default = _discover_default_ocr_model(resolver_fn=resolver_fn)\n    automatic_version = str(recommended_default.get("ocr_version") or "").strip()\n    automatic_language_codes = set()\n    for meta in model_meta.values():\n        if meta.get("id") == automatic_version:\n            automatic_language_codes.update(meta.get("languages") or [])\n    if not automatic_language_codes:\n        automatic_language_codes = {code for code, info in language_models.items()\n                                     if automatic_version in (info.get("models") or {})}\n\n    common_keys = None\n    pair_by_key = {}\n    for code in sorted(automatic_language_codes):\n        vinfo = ((language_models.get(code) or {}).get("models") or {}).get(automatic_version) or {}\n        pairs = [p for p in (vinfo.get("pairs") or []) if p.get("onnxruntime_supported")]\n        keys = {_pair_key(p) for p in pairs}\n        for p in pairs:\n            pair_by_key[_pair_key(p)] = p\n        common_keys = keys if common_keys is None else (common_keys & keys)\n    if common_keys is None:\n        common_keys = set()\n    automatic_pairs = [pair_by_key[key] for key in sorted(common_keys)]\n\n    automatic = _select_automatic_model(recommended_default, automatic_pairs)\n    if _pair_key(automatic) not in {_pair_key(p) for p in automatic_pairs}:\n        automatic_pairs.insert(0, automatic)\n\n    return {"ok":True,"paddleocr_version":version,"languages":languages,"models":models,\n            "language_models":language_models,\n            "paddleocr_default_model":dict(recommended_default),\n            "automatic_model":automatic,\n            "automatic_pairs":automatic_pairs}\n\n\ndef _resolve_model_config(language, model_selection):\n    from paddleocr import PaddleOCR\n    language = (language or "auto").strip().lower() or "auto"\n    if language in ("auto", "multilingual", "all"):\n        return _automatic_model_config()\n    if not model_selection or str(model_selection).strip().lower() == "auto":\n        raise RuntimeError("A concrete OCR model pair is required for a specific language.")\n    version = str(model_selection).strip()\n    resolver = object.__new__(PaddleOCR)\n    resolver_fn = getattr(resolver, "_get_ocr_model_names", None)\n    if not callable(resolver_fn):\n        raise RuntimeError("Installed PaddleOCR does not expose its OCR model resolver.")\n    det, rec = resolver_fn(language, version)\n    if not det or not rec:\n        raise RuntimeError(f"PaddleOCR does not provide model \'{version}\' for language \'{language}\'.")\n    return {"ocr_version":version,"detection_model":str(det),"recognition_model":str(rec),\n            "onnxruntime_supported":_model_pair_supports_onnx(det,rec)}\n\n\ndef _make_kwargs(language, model_config, providers, device, detection_limit=None):\n    from paddleocr import PaddleOCR\n    config = dict(model_config or {})\n    det = str(config.get("detection_model") or "").strip()\n    rec = str(config.get("recognition_model") or "").strip()\n    if not det or not rec:\n        raise RuntimeError(f"No concrete OCR detection/recognition model was supplied for language \'{language}\'.")\n    ort_config = {"providers":providers,"log_severity_level":3}\n    kwargs = {\n        "device":"gpu:0" if device == "GPU" else "cpu",\n        "engine":"onnxruntime",\n        "engine_config":{"onnxruntime":ort_config},\n        "use_doc_orientation_classify":False,\n        "use_doc_unwarping":False,\n        "use_textline_orientation":False,\n        # Crucially: do not pass lang/ocr_version here. PaddleOCR otherwise resolves\n        # its own pair and can overwrite explicit model-name selections.\n        "text_detection_model_name":det,\n        "text_recognition_model_name":rec,\n    }\n    if detection_limit is not None:\n        kwargs["text_det_limit_side_len"] = int(detection_limit)\n        kwargs["text_det_limit_type"] = "max"\n    return PaddleOCR, kwargs\n\n\ndef build_engine(language, model_config=None, prefer_gpu=False, require_gpu=False, detection_limit=None):\n    ort, providers, selected_device = _get_ort_runtime(bool(prefer_gpu))\n    cuda_available = "CUDAExecutionProvider" in ort.get_available_providers()\n    if require_gpu and not cuda_available:\n        raise RuntimeError("NVIDIA CUDA execution support is not available in this OCR environment.")\n    if model_config is None:\n        model_config = _resolve_model_config(language, "pipeline_auto" if str(language).lower()=="auto" else None)\n    runtime_config = dict(model_config or {})\n    PaddleOCR, kwargs = _make_kwargs(language, runtime_config, providers, selected_device, detection_limit=detection_limit)\n    try:\n        with native_quiet(): engine = PaddleOCR(**kwargs)\n        return engine, selected_device, runtime_config\n    except Exception as first_exc:\n        text = str(first_exc)\n        if "does not provide" in text and "onnx" in text.lower(): raise\n        if os.environ.get("PADDLE_PDX_MODEL_SOURCE") != "BOS":\n            os.environ["PADDLE_PDX_MODEL_SOURCE"] = "BOS"\n            emit_log("Default PaddleOCR model source failed; retrying with BOS...")\n            try:\n                with native_quiet(): engine = PaddleOCR(**kwargs)\n                return engine, selected_device, runtime_config\n            except Exception:\n                pass\n        raise first_exc\n\n\ndef check_runtime():\n    import onnxruntime as ort\n    versions={"paddleocr":importlib.metadata.version("paddleocr"),"paddlepaddle":importlib.metadata.version("paddlepaddle"),"onnxruntime":ort.__version__}\n    available=list(ort.get_available_providers())\n    if "CPUExecutionProvider" not in available:\n        raise RuntimeError("ONNX Runtime CPU execution support is missing.")\n    return {"ok":True,"versions":versions,"providers":available,"gpu_available":"CUDAExecutionProvider" in available}\n\n\ndef verify(prefer_gpu=False, require_gpu=False):\n    import onnxruntime as ort\n    versions={"paddleocr":importlib.metadata.version("paddleocr"),"paddlepaddle":importlib.metadata.version("paddlepaddle"),"onnxruntime":ort.__version__,"Pillow":importlib.metadata.version("Pillow")}\n    emit_log("Imported PaddleOCR, ONNX Runtime and Pillow successfully.")\n    if require_gpu and "CUDAExecutionProvider" not in ort.get_available_providers():\n        raise RuntimeError("GPU verification was requested, but CUDAExecutionProvider is unavailable.")\n    emit_log("Initializing OCR engine for a real smoke test...")\n    automatic = _automatic_model_config()\n    engine, device, _ = build_engine("auto", automatic, prefer_gpu=prefer_gpu, require_gpu=require_gpu, detection_limit=None)\n    from PIL import Image, ImageDraw, ImageFont\n    with tempfile.TemporaryDirectory(prefix="mergerz_ocr_verify_") as td:\n        path=Path(td)/"verify.png"\n        img=Image.new("RGB",(1600,500),"white"); draw=ImageDraw.Draw(img)\n        try: font=ImageFont.truetype("DejaVuSans.ttf",96)\n        except Exception: font=ImageFont.load_default()\n        draw.text((80,160),"Mergerz OCR 123",fill="black",font=font); img.save(path)\n        emit_log(f"Running OCR smoke test on {device}...")\n        started=time.monotonic()\n        with native_quiet(): raw=list(engine.predict(input=str(path)))\n        emit_log(f"OCR smoke inference finished in {time.monotonic()-started:.1f}s.")\n        if not raw: raise RuntimeError("OCR engine returned no result object during the smoke test.")\n        blocks=_normalize_result(raw[0])\n        if not blocks: raise RuntimeError("OCR smoke test completed, but no text regions were recognized.")\n        emit_log(f"OCR smoke test returned {len(blocks)} recognized region(s).")\n    return {"versions":versions,"device":device}\n\n\ndef _config_key(language, model_config, detection_limit=None):\n    c=model_config or {}\n    return (str(language or "auto").lower(),str(c.get("ocr_version") or ""),str(c.get("detection_model") or ""),str(c.get("recognition_model") or ""),detection_limit)\n\n\ndef serve(prefer_gpu=False):\n    engine_cache={}; device_cache={}; config_cache={}\n    emit_log("OCR plugin runner ready; GPU preference=" + ("enabled" if prefer_gpu else "disabled"))\n    for line in sys.stdin:\n        line=line.strip()\n        if not line: continue\n        req=None\n        try:\n            req=json.loads(line); rid=req.get("id"); language=req.get("language") or "auto"; image_path=str(req.get("image_path") or "")\n            if not image_path or not os.path.isfile(image_path): raise RuntimeError("OCR input image does not exist.")\n            model_config=req.get("model_config")\n            if not isinstance(model_config,dict):\n                model_config=_resolve_model_config(language,req.get("model"))\n            detection_limit=req.get("detection_limit_px")\n            if detection_limit in (None,"","model_default"): detection_limit=None\n            else:\n                try: detection_limit=max(1,int(detection_limit))\n                except Exception: raise RuntimeError("OCR detection-size selection is invalid.")\n            key=_config_key(language,model_config,detection_limit)\n            if key not in engine_cache:\n                version=str(model_config.get("ocr_version") or "Automatic")\n                emit_log(f"Initializing OCR engine for language \'{language}\' using model \'{version}\'...")\n                engine,device,actual=build_engine(language,model_config=model_config,prefer_gpu=prefer_gpu,require_gpu=bool(prefer_gpu),detection_limit=detection_limit)\n                engine_cache[key]=engine; device_cache[key]=device; config_cache[key]=actual\n                emit_log(f"OCR model loaded: detection={actual.get(\'detection_model\')}, recognition={actual.get(\'recognition_model\')}")\n            actual=config_cache[key]\n            limit_text="model default" if detection_limit is None else f"{detection_limit}px"\n            emit_log(f"OCR inference started: model={actual.get(\'ocr_version\') or \'Automatic\'}; detection size={limit_text}")\n            started=time.monotonic()\n            with native_quiet(): raw=list(engine_cache[key].predict(input=image_path))\n            emit_log(f"OCR inference finished in {time.monotonic()-started:.1f}s.")\n            if len(raw)!=1: raise RuntimeError(f"PaddleOCR returned {len(raw)} result objects for one input image.")\n            blocks=_normalize_result(raw[0])\n            sys.stdout.write(json.dumps({"id":rid,"ok":True,"blocks":blocks,"device":device_cache[key],"model":actual},ensure_ascii=False)+"\\n"); sys.stdout.flush()\n        except Exception as exc:\n            emit_log(traceback.format_exc())\n            try:\n                sys.stdout.write(json.dumps({"id":req.get("id") if isinstance(req,dict) else None,"ok":False,"error":f"{type(exc).__name__}: {exc}"})+"\\n"); sys.stdout.flush()\n            except Exception: pass\n\n\ndef main():\n    ap=argparse.ArgumentParser(); ap.add_argument("--languages",action="store_true"); ap.add_argument("--capabilities",action="store_true"); ap.add_argument("--default-model",action="store_true"); ap.add_argument("--check",action="store_true"); ap.add_argument("--verify",action="store_true"); ap.add_argument("--serve",action="store_true"); ap.add_argument("--prefer-gpu",action="store_true"); ap.add_argument("--require-gpu",action="store_true")\n    args=ap.parse_args()\n    if args.default_model:\n        # This probe intentionally returns PaddleOCR\'s raw resolver result, not Mergerz\'s\n        # small-model automatic choice. The main app uses it to detect upstream default changes.\n        print(json.dumps({"ok":True,"paddleocr_default_model":_discover_default_ocr_model()},ensure_ascii=False)); return 0\n    if args.capabilities or args.languages:\n        print(json.dumps(discover_capabilities(),ensure_ascii=False)); return 0\n    if args.check:\n        print(json.dumps(check_runtime(),ensure_ascii=False)); return 0\n    if args.verify:\n        result=verify(prefer_gpu=args.prefer_gpu,require_gpu=args.require_gpu); print(json.dumps({"ok":True,**result})); return 0\n    if args.serve:\n        serve(prefer_gpu=args.prefer_gpu); return 0\n    raise SystemExit("Specify --capabilities, --check, --verify or --serve.")\n\nif __name__ == "__main__":\n    try: raise SystemExit(main())\n    except Exception: emit_log(traceback.format_exc()); raise\n'
 
 
-def _sync_ocr_runner(root):
-    """Keep an existing OCR installation's runner in sync with the app source."""
-    path = _ocr_runner_path(root)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            current = fh.read()
-    except Exception:
-        current = None
-    if current != _PLUGIN_RUNNER_SOURCE:
-        _write_plugin_runner(root)
 
 
-def _read_json_file(path):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
 
 
-def _write_json_atomic(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-        fh.write("\n")
-    os.replace(tmp, path)
 
 
-def _run_capture(cmd, env=None, cwd=None, timeout=None, input_text=None):
-    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env, check=False)
-    if timeout is not None:
-        kwargs["timeout"] = timeout
-    if input_text is not None:
-        kwargs["input"] = input_text
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(cmd, **kwargs)
+
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\-_]|\[[0-?]*[ -/]*[@-~])")
 
-def _strip_ansi_sequences(text):
-    return _ANSI_ESCAPE_RE.sub("", str(text))
 
 
 def _plugin_data_root():
@@ -9138,6 +9065,177 @@ def _normalize_machine_arch(machine=None):
         return "aarch64"
     return value or "unknown"
 
+
+# ---------------------------------------------------------------------------
+# UV package supplied by the Mergerz Python environment
+# ---------------------------------------------------------------------------
+# `uv` is a required project dependency. Always resolve its executable from the
+# installed `uv` distribution itself; never fall back to an arbitrary global PATH
+# entry. UV-managed Python versions and caches remain per-user application data.
+
+def _uv_data_root():
+    """Return Mergerz's per-user storage for UV-managed Python builds and caches."""
+    return os.path.join(os.path.dirname(_plugin_data_root()), "tools", "uv")
+
+
+def _uv_parse_version(output):
+    match = re.search(
+        r"\buv\s+([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)",
+        str(output or ""),
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def _uv_distribution_paths():
+    """Resolve this environment's UV package, metadata, and native command paths."""
+    import importlib.metadata as importlib_metadata
+    import sysconfig
+
+    distribution = importlib_metadata.distribution("uv")
+    version = str(distribution.version or "").strip()
+    if not version:
+        raise RuntimeError("The installed UV distribution has no version metadata.")
+
+    files = list(distribution.files or ())
+    metadata_file = next(
+        (
+            item for item in files
+            if ".dist-info/" in str(item).replace("\\", "/")
+            and str(item).replace("\\", "/").endswith(".dist-info/METADATA")
+        ),
+        None,
+    )
+    if metadata_file is None:
+        raise RuntimeError("The installed UV distribution has no .dist-info/METADATA file.")
+    dist_info = os.path.abspath(os.fspath(distribution.locate_file(metadata_file)))
+    dist_info = os.path.dirname(dist_info)
+    site_packages = os.path.dirname(dist_info)
+    package_dir = os.path.join(site_packages, "uv")
+
+    executable_name = "uv.exe" if os.name == "nt" else "uv"
+    uvx_name = "uvx.exe" if os.name == "nt" else "uvx"
+    uv_candidates = []
+    uvx_candidates = []
+    for item in files:
+        base_name = os.path.basename(str(item).replace("\\", "/")).casefold()
+        if base_name not in {executable_name.casefold(), uvx_name.casefold()}:
+            continue
+        candidate = os.path.abspath(os.fspath(distribution.locate_file(item)))
+        if base_name == executable_name.casefold():
+            uv_candidates.append(candidate)
+        else:
+            uvx_candidates.append(candidate)
+
+    # Wheels installed with --user can expose scripts in the user scheme instead
+    # of the interpreter's default scripts directory. Check only Python installation
+    # schemes; do not accidentally select a system/global UV found on PATH.
+    script_dirs = []
+    try:
+        script_dirs.append(sysconfig.get_path("scripts"))
+    except Exception:
+        pass
+    try:
+        script_dirs.append(
+            sysconfig.get_path(
+                "scripts", scheme=sysconfig.get_preferred_scheme("user")
+            )
+        )
+    except Exception:
+        pass
+    for script_dir in script_dirs:
+        if script_dir:
+            uv_candidates.append(os.path.join(script_dir, executable_name))
+            uvx_candidates.append(os.path.join(script_dir, uvx_name))
+
+    def first_existing(candidates):
+        seen = set()
+        for candidate in candidates:
+            candidate = os.path.abspath(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    executable = first_existing(uv_candidates)
+    uvx_executable = first_existing(uvx_candidates)
+    if not executable:
+        raise RuntimeError(
+            "The UV Python package is installed, but its native executable was not found "
+            "in that distribution's installation scheme."
+        )
+    return {
+        "version": version,
+        "executable": executable,
+        "uvx_executable": uvx_executable,
+        "scripts_dir": os.path.dirname(executable),
+        "package_dir": package_dir,
+        "dist_info": dist_info,
+        "site_packages": site_packages,
+    }
+
+
+def _uv_current_info():
+    """Return UV metadata only when its native executable matches this Python install."""
+    try:
+        info = _uv_distribution_paths()
+        cp = _run_capture([info["executable"], "--version"], timeout=15)
+        output = "\n".join(part for part in (cp.stdout, cp.stderr) if part)
+        actual_version = _uv_parse_version(output)
+        if cp.returncode != 0 or not actual_version or actual_version != info["version"]:
+            return None
+        return info
+    except Exception:
+        return None
+
+
+def _uv_operation_env(base=None):
+    """Keep UV-managed Python builds and caches under Mergerz's per-user data root."""
+    env = dict(os.environ if base is None else base)
+    uv_root = os.path.abspath(_uv_data_root())
+    env["UV_NO_PROGRESS"] = "1"
+    env["UV_NO_CONFIG"] = "1"
+    env["UV_CACHE_DIR"] = os.path.join(uv_root, "cache")
+    env["UV_PYTHON_INSTALL_DIR"] = os.path.join(uv_root, "python")
+    env["UV_PYTHON_BIN_DIR"] = os.path.join(uv_root, "python-bin")
+    env["UV_PYTHON_CACHE_DIR"] = os.path.join(uv_root, "python-cache")
+    env["UV_PYTHON_INSTALL_BIN"] = "0"
+    return env
+
+
+def _uv_package_command(action, python_executable, arguments=()):
+    """Construct a UV pip-interface command pinned to one explicit interpreter."""
+    action = str(action or "").strip().lower()
+    if action not in {"install", "uninstall", "list", "show", "check", "freeze"}:
+        raise ValueError(f"Unsupported UV package operation: {action}")
+    uv = _uv_current_info()
+    if not uv:
+        raise RuntimeError(
+            "The UV package is missing or broken in the Python environment running Mergerz. "
+            "Repair the Mergerz installation in that same environment with "
+            "`python -m pip install --upgrade mergerz`, then restart Mergerz."
+        )
+    python_executable = os.path.abspath(str(python_executable or "").strip())
+    if not python_executable or not os.path.isfile(python_executable):
+        raise RuntimeError("The target Python interpreter for UV package management does not exist.")
+    return [
+        uv["executable"], "--no-progress", "--no-config", "pip", action,
+        "--python", python_executable,
+    ] + [str(arg) for arg in arguments]
+
+
+def _uv_check_environment(worker, task, python_executable, env=None, cwd=None,
+                           label="Checking package compatibility..."):
+    """Run UV's dependency-consistency check against the exact target environment."""
+    task._run_proc(
+        worker,
+        _uv_package_command("check", python_executable),
+        cwd=cwd,
+        env=_uv_operation_env(env),
+        label=label,
+    )
 
 def _libreoffice_platform_descriptor():
     arch = _normalize_machine_arch()
@@ -9297,14 +9395,47 @@ def _official_checksum(url, filename, worker=None):
     return None, None
 
 
-def _safe_extract_tarfile(tar, dest):
+def _archive_path_within_root(root, candidate):
+    root = os.path.realpath(os.path.abspath(root))
+    candidate = os.path.realpath(os.path.abspath(candidate))
+    try: return os.path.commonpath((root, candidate)) == root
+    except ValueError: return False
+
+
+def _validate_tar_members(tar, dest):
+    """Validate paths, links, and special files before extracting any archive member."""
     root = os.path.realpath(os.path.abspath(dest))
     prefix = root if root.endswith(os.sep) else root + os.sep
     for member in tar.getmembers():
-        target = os.path.realpath(os.path.abspath(os.path.join(root, member.name)))
-        if target != root and not target.startswith(prefix):
+        member_path = os.path.abspath(os.path.join(root, member.name.replace("/", os.sep)))
+        if not _archive_path_within_root(root, member_path):
             raise RuntimeError(f"Unsafe LibreOffice archive member path: {member.name}")
-    tar.extractall(dest, filter="fully_trusted")
+        parent = os.path.dirname(member_path)
+        while parent != root and parent.startswith(prefix):
+            if os.path.islink(parent):
+                raise RuntimeError(f"Unsafe pre-existing symlink in extraction path: {member.name}")
+            parent = os.path.dirname(parent)
+        if member.issym():
+            # Symbolic-link targets are interpreted relative to the symlink's parent directory.
+            link_target = os.path.abspath(
+                os.path.join(os.path.dirname(member_path), member.linkname.replace("/", os.sep))
+            )
+            if not _archive_path_within_root(root, link_target):
+                raise RuntimeError(f"Unsafe LibreOffice archive link target: {member.name} -> {member.linkname}")
+        elif member.islnk():
+            # Tar hard-link targets are archive-root-relative, unlike symbolic links.
+            link_target = os.path.abspath(os.path.join(root, member.linkname.replace("/", os.sep)))
+            if not _archive_path_within_root(root, link_target):
+                raise RuntimeError(f"Unsafe LibreOffice archive hard-link target: {member.name} -> {member.linkname}")
+        if member.isdev() or member.isfifo():
+            raise RuntimeError(f"Unsupported special file in LibreOffice archive: {member.name}")
+
+
+def _safe_extract_tarfile(tar, dest):
+    _validate_tar_members(tar, dest)
+    data_filter = getattr(tarfile, "data_filter", None)
+    if callable(data_filter): tar.extractall(dest, filter=data_filter)
+    else: tar.extractall(dest)
 
 
 def _extract_tar_gz_all(archive_path, dest):
@@ -9338,19 +9469,46 @@ def _extract_deb_payload(deb_bytes, dest):
                 with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as tar:
                     _safe_extract_tarfile(tar, dest)
             except tarfile.ReadError as exc:
-                payload_path = os.path.join(dest, ".libreoffice_data_payload")
-                with open(payload_path, "wb") as fh:
-                    fh.write(payload)
+                # Python 3.10 does not know every compression format that LibreOffice may
+                # publish (notably newer .zst payloads). Decompress to a temporary tar file
+                # with the platform tool, then feed the resulting uncompressed archive through
+                # the same safe Python extractor above. Never hand the raw archive directly to
+                # `tar -xf`, because that would bypass our traversal/link validation.
+                suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                decompressor = {
+                    "zst": ["zstd", "-d", "-c"],
+                    "xz": ["xz", "-d", "-c"],
+                    "bz2": ["bzip2", "-d", "-c"],
+                    "gz": ["gzip", "-d", "-c"],
+                }.get(suffix)
+                if not decompressor:
+                    raise RuntimeError(
+                        f"Unsupported Debian payload compression: {name}"
+                    ) from exc
                 try:
                     cp = subprocess.run(
-                        ["tar", "-xf", payload_path, "-C", dest],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                        timeout=180, check=False)
-                    if cp.returncode != 0:
-                        raise RuntimeError(
-                            "Unsupported Debian payload compression and tar fallback failed: "
-                            + (cp.stderr.strip() or f"exit code {cp.returncode}")
-                        ) from exc
+                        decompressor,
+                        input=payload,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=180,
+                        check=False,
+                    )
+                except FileNotFoundError as tool_exc:
+                    raise RuntimeError(
+                        f"The {suffix} decompressor required for the LibreOffice package is not installed."
+                    ) from tool_exc
+                if cp.returncode != 0:
+                    detail = cp.stderr.decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(
+                        f"LibreOffice payload decompression failed: {detail or f'exit code {cp.returncode}'}"
+                    ) from exc
+                payload_path = os.path.join(dest, ".libreoffice_data_payload.tar")
+                try:
+                    with open(payload_path, "wb") as fh:
+                        fh.write(cp.stdout)
+                    with tarfile.open(payload_path, mode="r:") as unpacked_tar:
+                        _safe_extract_tarfile(unpacked_tar, dest)
                 finally:
                     try:
                         os.remove(payload_path)
@@ -9774,17 +9932,15 @@ def _lo_cache_matches_runtime_version(runtime_version):
 
 def _save_libreoffice_converter_cache(cache):
     global APP_SETTINGS
-    if not _lo_cache_is_structurally_valid(cache):
-        raise ValueError("Invalid LibreOffice converter capability cache.")
-    candidate = _get_app_settings_snapshot()
-    candidate["libreoffice"] = json.loads(json.dumps(cache))
-    candidate["settings_version"] = SETTINGS_VERSION
-    if not _validate_settings(candidate):
-        raise ValueError("Invalid application settings containing LibreOffice cache.")
-    if not _write_settings_file(candidate):
-        raise RuntimeError("settings.json could not be updated with the LibreOffice converter capability cache.")
-    APP_SETTINGS = candidate
-    return json.loads(json.dumps(cache))
+    if not _lo_cache_is_structurally_valid(cache): raise ValueError("Invalid LibreOffice converter capability cache.")
+    with _SETTINGS_IO_LOCK:
+        candidate = _get_app_settings_snapshot()
+        candidate["libreoffice"] = json.loads(json.dumps(cache))
+        candidate["settings_version"] = SETTINGS_VERSION
+        if not _validate_settings(candidate): raise ValueError("Invalid application settings containing LibreOffice cache.")
+        if not _write_settings_file(candidate): raise RuntimeError("settings.json could not be updated with the LibreOffice converter capability cache.")
+        APP_SETTINGS = candidate
+        return json.loads(json.dumps(cache))
 
 
 def _lo_localized_name(props, fallback=""):
@@ -10512,6 +10668,295 @@ def _pdf2docx_venv_python(root=None):
     return os.path.join(root, "venv", "bin", "python")
 
 
+# Python runtime choices for isolated Python plugins. "current" means the exact
+# interpreter that launched Mergerz; a value like "3.13" means a managed CPython
+# minor version resolved and created by the UV dependency.
+_PYTHON_RUNTIME_PREFS_SCHEMA = 1
+_PYTHON_RUNTIME_CURRENT = "current"
+_PYTHON_RUNTIME_DEFAULTS = {
+    OCR_PLUGIN_ID: "3.13",
+    PDF2DOCX_PLUGIN_ID: "current",
+}
+_PYTHON_RUNTIME_FALLBACK_CATALOG = {
+    # Used only if UV's catalogue cannot be read. Runtime validation has no OCR-specific
+    # upper cap, and a successful UV catalogue lookup always supersedes these fallbacks.
+    OCR_PLUGIN_ID: ["3.14", "3.13", "3.12", "3.11", "3.10"],
+    PDF2DOCX_PLUGIN_ID: ["3.14", "3.13", "3.12", "3.11", "3.10"],
+}
+
+
+def _python_runtime_preferences_path():
+    return os.path.join(os.path.dirname(_plugin_data_root()), "python-runtime-preferences.json")
+
+
+def _load_python_runtime_preferences():
+    data = _read_json_file(_python_runtime_preferences_path()) or {}
+    if data.get("schema_version") != _PYTHON_RUNTIME_PREFS_SCHEMA:
+        return {"schema_version": _PYTHON_RUNTIME_PREFS_SCHEMA, "plugins": {}}
+    plugins = data.get("plugins")
+    return {
+        "schema_version": _PYTHON_RUNTIME_PREFS_SCHEMA,
+        "plugins": dict(plugins) if isinstance(plugins, dict) else {},
+    }
+
+
+def _valid_python_runtime_selection(plugin_id, selection):
+    value = str(selection or "").strip().lower()
+    if value == _PYTHON_RUNTIME_CURRENT:
+        return True
+    match = re.fullmatch(r"(\d+)\.(\d+)", value)
+    if not match:
+        return False
+    major_minor = (int(match.group(1)), int(match.group(2)))
+    # These plugins currently target CPython 3.x; reject malformed/future-major
+    # values even if they compare numerically above the minimum tuple.
+    if major_minor[0] != 3 or major_minor < (3, 10):
+        return False
+    # Do not impose an application-level upper bound on OCR Python versions.
+    # The UV catalogue advertises current stable CPython minors; PaddleOCR/PaddlePaddle
+    # compatibility is validated by installing binary wheels and running verification.
+    return plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID}
+
+
+def _get_python_runtime_selection(plugin_id):
+    plugin_id = str(plugin_id or "")
+    preferences = _load_python_runtime_preferences().get("plugins") or {}
+    saved = str(preferences.get(plugin_id) or "").strip().lower()
+    if _valid_python_runtime_selection(plugin_id, saved):
+        return saved
+    default = _PYTHON_RUNTIME_DEFAULTS.get(plugin_id, _PYTHON_RUNTIME_CURRENT)
+    if _valid_python_runtime_selection(plugin_id, default):
+        return default
+    return _PYTHON_RUNTIME_CURRENT
+
+
+def _set_python_runtime_selection(plugin_id, selection):
+    plugin_id = str(plugin_id or "")
+    selection = str(selection or "").strip().lower()
+    if not _valid_python_runtime_selection(plugin_id, selection):
+        raise ValueError(f"Unsupported Python runtime choice for {plugin_id}: {selection}")
+    payload = _load_python_runtime_preferences()
+    plugins = dict(payload.get("plugins") or {})
+    plugins[plugin_id] = selection
+    payload["plugins"] = plugins
+    path = _python_runtime_preferences_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_json_atomic(path, payload)
+    return selection
+
+
+def _python_runtime_catalog_for_ui():
+    """Read the UV-installed Python catalogue, with compatible fallback choices if unavailable."""
+    fallback = {key: list(value) for key, value in _PYTHON_RUNTIME_FALLBACK_CATALOG.items()}
+    uv = _uv_current_info()
+    if not uv:
+        return {
+            "source": "fallback",
+            OCR_PLUGIN_ID: fallback[OCR_PLUGIN_ID],
+            PDF2DOCX_PLUGIN_ID: fallback[PDF2DOCX_PLUGIN_ID],
+        }
+    # Use the per-user managed Python/cache locations for catalogue and venv operations.
+    env = _uv_operation_env()
+    try:
+        cp = _run_capture([uv["executable"], "python", "list"], env=env, timeout=45)
+        if cp.returncode != 0:
+            raise RuntimeError(cp.stderr.strip() or "uv python list failed")
+        found = set()
+        # uv catalogue records are machine-readable enough to identify the stable CPython
+        # minor from their canonical cpython-MAJOR.MINOR.PATCH identifiers. Ignore beta/RC
+        # versions and all non-CPython implementations.
+        for line in cp.stdout.splitlines():
+            match = re.search(r"\bcpython-(\d+)\.(\d+)\.(\d+)(?=[-\s]|$)", line, re.IGNORECASE)
+            if not match:
+                continue
+            major, minor, _patch = (int(part) for part in match.groups())
+            if major == 3 and minor >= 10:
+                found.add(f"{major}.{minor}")
+        if not found:
+            raise RuntimeError("uv's Python catalogue did not contain any supported stable CPython builds")
+        version_key = lambda value: tuple(int(part) for part in value.split("."))
+        pdf_versions = sorted(found, key=version_key, reverse=True)
+        # Keep OCR's offered Python versions aligned with UV's current stable CPython
+        # catalogue. Whether PaddleOCR/PaddlePaddle support a particular version is tested
+        # during package installation and the plugin verification step, not hardcoded here.
+        ocr_versions = list(pdf_versions)
+        return {
+            "source": "uv",
+            OCR_PLUGIN_ID: ocr_versions,
+            PDF2DOCX_PLUGIN_ID: pdf_versions,
+        }
+    except Exception:
+        return {
+            "source": "fallback",
+            OCR_PLUGIN_ID: fallback[OCR_PLUGIN_ID],
+            PDF2DOCX_PLUGIN_ID: fallback[PDF2DOCX_PLUGIN_ID],
+        }
+
+
+def _plugin_python_runtime_info(python_executable):
+    """Probe the interpreter inside a plugin venv instead of trusting Mergerz's runtime."""
+    source = (
+        "import json,platform,struct,sys; "
+        "print(json.dumps({'version':platform.python_version(),"
+        "'version_tuple':list(sys.version_info[:3]),"
+        "'implementation':platform.python_implementation(),"
+        "'bits':struct.calcsize('P')*8}))"
+    )
+    cp = _run_capture([python_executable, "-c", source], timeout=15)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            cp.stderr.strip() or cp.stdout.strip() or "Could not identify the selected plugin Python runtime."
+        )
+    try:
+        probe = json.loads(cp.stdout.strip().splitlines()[-1])
+        version_tuple = tuple(int(value) for value in probe["version_tuple"][:3])
+        if len(version_tuple) != 3:
+            raise ValueError("incomplete Python version")
+        runtime = _current_runtime_info()
+        runtime.update({
+            "python": str(probe["version"]),
+            "python_tuple": version_tuple,
+            "implementation": str(probe["implementation"]),
+            "bits": int(probe["bits"]),
+        })
+        return runtime
+    except Exception as exc:
+        raise RuntimeError(f"The selected plugin Python runtime returned invalid version metadata: {exc}") from exc
+
+
+def _probe_plugin_python_for_display(python_executable):
+    """Return the actual interpreter version for UI labels, including pre-runtime manifests."""
+    source = (
+        "import json,platform,sys; "
+        "print(json.dumps({'version':platform.python_version(),"
+        "'implementation':platform.python_implementation()}))"
+    )
+    cp = _run_capture([python_executable, "-c", source], timeout=10)
+    if cp.returncode != 0:
+        raise RuntimeError(
+            cp.stderr.strip() or cp.stdout.strip() or "Could not read the installed plugin Python version."
+        )
+    try:
+        probe = json.loads(cp.stdout.strip().splitlines()[-1])
+        version = str(probe.get("version") or "").strip()
+        implementation = str(probe.get("implementation") or "").strip()
+        if not version:
+            raise ValueError("the interpreter returned an empty version")
+        return {"version": version, "implementation": implementation}
+    except Exception as exc:
+        raise RuntimeError(f"Invalid plugin Python version metadata: {exc}") from exc
+
+
+def _create_python_plugin_venv(worker, root, plugin_id, selection, run_proc):
+    """Create an isolated venv using either the exact current interpreter or uv-managed CPython."""
+    selection = str(selection or _get_python_runtime_selection(plugin_id)).strip().lower()
+    if not _valid_python_runtime_selection(plugin_id, selection):
+        raise RuntimeError(f"Python {selection} is not a supported runtime choice for {plugin_id}.")
+    venv_path = os.path.join(root, "venv")
+    plugin_name = "OCR" if plugin_id == OCR_PLUGIN_ID else "PDF2DOCX"
+    if selection == _PYTHON_RUNTIME_CURRENT:
+        command = [sys.executable, "-m", "venv", "--without-pip", venv_path]
+        worker.log(
+            f"Using the current Mergerz Python {platform.python_version()}.", "info"
+        )
+    else:
+        uv = _uv_current_info()
+        if not uv:
+            raise RuntimeError(
+                "The selected Python runtime requires the UV dependency installed with Mergerz. "
+                "Repair Mergerz in the same Python environment, then restart the application."
+            )
+        command = [uv["executable"], "--no-progress", "--no-config", "venv", "--python", selection, "--managed-python", venv_path]
+        worker.log(f"Preparing managed Python {selection} with UV.", "info")
+    # Keep the prominent progress headline short enough for the dialog at every window size.
+    run_proc(
+        worker, command, cwd=root, env=_uv_operation_env(),
+        label=f"Creating {plugin_name} environment...",
+    )
+
+    python_executable = (
+        _ocr_venv_python(root) if plugin_id == OCR_PLUGIN_ID
+        else _pdf2docx_venv_python(root)
+    )
+    if not os.path.isfile(python_executable):
+        raise RuntimeError(f"The isolated {plugin_id} Python environment was not created correctly.")
+    runtime = _plugin_python_runtime_info(python_executable)
+    selected_tuple = tuple(int(part) for part in selection.split(".")) if selection != _PYTHON_RUNTIME_CURRENT else None
+    if selected_tuple and tuple(runtime["python_tuple"][:2]) != selected_tuple:
+        raise RuntimeError(
+            f"Requested managed Python {selection}, but the created environment uses Python {runtime['python']}."
+        )
+    if runtime["implementation"] != "CPython":
+        raise RuntimeError(f"The {plugin_id} plugin requires CPython, not {runtime['implementation']}.")
+    return python_executable, runtime
+
+
+def _require_uv_for_package_operations(worker=None, selection=None):
+    """Require the UV package installed with Mergerz; never download a second UV binary."""
+    uv = _uv_current_info()
+    if not uv:
+        raise RuntimeError(
+            "UV is required but is missing or broken in the Python environment running Mergerz. "
+            "Repair that environment with `python -m pip install --upgrade mergerz`, "
+            "then restart Mergerz."
+        )
+    if worker is not None:
+        worker.log(f"Using UV {uv['version']} from the Mergerz Python environment.", "info")
+        selection = str(selection or "").strip().lower()
+        if selection and selection != _PYTHON_RUNTIME_CURRENT:
+            worker.log(f"Selected managed Python runtime: {selection}.", "info")
+    return uv
+
+
+def _python_runtime_display_text(status):
+    """Display the actual installed plugin interpreter, never a prospective target."""
+    if not status.get("installed"):
+        return ""
+    manifest = status.get("manifest") or {}
+    meta = manifest.get("python") or {}
+    probed = status.get("python_runtime") or {}
+    # Prefer a live probe from the isolated venv. This also correctly labels plugin
+    # environments created by older Mergerz versions whose manifests have no Python field.
+    version = str(probed.get("version") or meta.get("version") or "").strip()
+    if not version:
+        return ""
+    source = str(meta.get("source") or "").strip().lower()
+    if source == "uv-managed":
+        return f"Python {version} · UV"
+    if source == "current":
+        return f"Python {version} · Current"
+    return f"Python {version}"
+
+
+def _get_installed_python_runtime_selection(plugin_id):
+    """Reuse an installed plugin's recorded runtime when rebuilding it during an update."""
+    plugin_id = str(plugin_id or "")
+    if plugin_id == OCR_PLUGIN_ID:
+        manifest = _read_json_file(_ocr_manifest_path()) or {}
+    elif plugin_id == PDF2DOCX_PLUGIN_ID:
+        manifest = _read_json_file(_pdf2docx_manifest_path()) or {}
+    else:
+        return _get_python_runtime_selection(plugin_id)
+
+    meta = manifest.get("python") or {}
+    recorded = str(meta.get("selection") or "").strip().lower()
+    if _valid_python_runtime_selection(plugin_id, recorded):
+        return recorded
+
+    # Older manifests may have the actual version/source but no explicit selection.
+    source = str(meta.get("source") or "").strip().lower()
+    if source == "current":
+        return _PYTHON_RUNTIME_CURRENT
+    if source == "uv-managed":
+        version = str(meta.get("version") or "").strip()
+        match = re.match(r"^(\d+\.\d+)(?:\.|$)", version)
+        if match and _valid_python_runtime_selection(plugin_id, match.group(1)):
+            return match.group(1)
+
+    # Legacy manifests without runtime metadata fall back to the saved install choice/default.
+    return _get_python_runtime_selection(plugin_id)
+
+
 def _pdf2docx_plugin_env(root=None):
     root = root or _pdf2docx_active_root()
     env = os.environ.copy()
@@ -10702,8 +11147,6 @@ def _ocr_package_plan(runtime=None, gpu=False):
     py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
     if py < OCR_PYTHON_MIN:
         raise RuntimeError("The OCR plugin requires Python 3.10 or newer.")
-    if py > OCR_PYTHON_MAX[:2]:
-        raise RuntimeError("The OCR plugin currently supports Python up to 3.14 in its tested package matrix.")
     if runtime["bits"] != 64:
         raise RuntimeError("The OCR plugin requires a 64-bit Python runtime.")
 
@@ -10717,6 +11160,8 @@ def _ocr_package_plan(runtime=None, gpu=False):
         packages = ["onnxruntime"]
         mode = "cpu"
     packages.insert(0, "paddleocr")
+    # PaddleOCR imports paddle.utils during package initialization, even with engine="onnxruntime".
+    packages.insert(1, "paddlepaddle")
 
     return {
         "mode": mode,
@@ -10865,12 +11310,32 @@ def _package_versions_in_venv(python_exe, package_names):
     return json.loads(cp.stdout.strip().splitlines()[-1])
 
 
-def _pip_list_in_venv(python_exe, env=None):
-    script = "import json, importlib.metadata as m; print(json.dumps(sorted([(d.metadata['Name'], d.version) for d in m.distributions()], key=lambda x:x[0].lower())))"
-    cp = _run_capture([python_exe, "-c", script], env=env, timeout=60)
+def _uv_list_in_venv(python_exe, env=None):
+    """Return installed package names and versions from UV's package inspector."""
+    cp = _run_capture(
+        _uv_package_command("list", python_exe, ("--format", "json")),
+        env=_uv_operation_env(env), timeout=90,
+    )
     if cp.returncode != 0:
-        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "Could not inspect plugin packages.")
-    return {name.lower(): version for name, version in json.loads(cp.stdout.strip().splitlines()[-1])}
+        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "UV could not inspect plugin packages.")
+    try:
+        output = cp.stdout.strip()
+        if not output:
+            raise ValueError("empty JSON response")
+        payload = json.loads(output)
+        if not isinstance(payload, list):
+            raise ValueError("expected a JSON array")
+        result = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower().replace("_", "-")
+            version = str(item.get("version") or "").strip()
+            if name and version:
+                result[name] = version
+        return result
+    except Exception as exc:
+        raise RuntimeError(f"UV returned an invalid package-list response: {exc}") from exc
 
 
 def _nvidia_packages(packages):
@@ -10915,7 +11380,7 @@ def _ocr_language_name(code):
     except ImportError as exc:
         raise RuntimeError(
             "OCR language names require the 'python-iso639' package. "
-            "Install it with: python3 -m pip install python-iso639"
+            "Install python-iso639 into the Mergerz Python environment to enable localized language names."
         ) from exc
 
     try:
@@ -11147,24 +11612,17 @@ def _save_ocr_capability_cache(
 ):
     global APP_SETTINGS
     cache = _normalize_ocr_capabilities(
-        paddleocr_version,
-        languages,
-        models,
-        language_models,
-        automatic_model,
-        automatic_pairs=automatic_pairs,
-        paddleocr_default_model=paddleocr_default_model,
+        paddleocr_version, languages, models, language_models, automatic_model,
+        automatic_pairs=automatic_pairs, paddleocr_default_model=paddleocr_default_model,
     )
-    candidate = _get_app_settings_snapshot()
-    candidate["ocr"] = cache
-    candidate["settings_version"] = SETTINGS_VERSION
-    if not _validate_settings(candidate):
-        raise ValueError("Invalid OCR capability cache.")
-    if not _write_settings_file(candidate):
-        raise RuntimeError("settings.json could not be updated with the OCR capability cache.")
-    APP_SETTINGS = candidate
-    return cache
-
+    with _SETTINGS_IO_LOCK:
+        candidate = _get_app_settings_snapshot()
+        candidate["ocr"] = cache
+        candidate["settings_version"] = SETTINGS_VERSION
+        if not _validate_settings(candidate): raise ValueError("Invalid OCR capability cache.")
+        if not _write_settings_file(candidate): raise RuntimeError("settings.json could not be updated with the OCR capability cache.")
+        APP_SETTINGS = candidate
+        return cache
 
 
 def _ocr_capability_cache_matches(paddleocr_version):
@@ -11223,29 +11681,6 @@ def _fetch_ocr_languages_from_plugin(root, worker=None):
     }
 
 
-def _model_pair_is_cached_onnx_capable(cache, pair):
-    """Return whether an exact pair is already present as an ONNX-capable cached choice."""
-    if not isinstance(pair, dict):
-        return False
-    version = str(pair.get("ocr_version") or "").strip()
-    det = str(pair.get("detection_model") or "").strip()
-    rec = str(pair.get("recognition_model") or "").strip()
-    if not version or not det or not rec:
-        return False
-    for code_info in (cache.get("language_models") or {}).values():
-        for vinfo in ((code_info.get("models") or {}).get(version),) if isinstance(code_info, dict) else ():
-            for candidate in (vinfo or {}).get("pairs", []) if isinstance(vinfo, dict) else []:
-                if (candidate.get("detection_model") == det
-                        and candidate.get("recognition_model") == rec
-                        and candidate.get("onnxruntime_supported")):
-                    return True
-    for candidate in cache.get("automatic_pairs") or []:
-        if (candidate.get("ocr_version") == version
-                and candidate.get("detection_model") == det
-                and candidate.get("recognition_model") == rec
-                and candidate.get("onnxruntime_supported")):
-            return True
-    return False
 
 
 def _ensure_ocr_languages(status, worker=None):
@@ -11268,7 +11703,7 @@ def _ensure_ocr_languages(status, worker=None):
     except ImportError as exc:
         raise RuntimeError(
             "OCR language names require the 'python-iso639' package. "
-            "Install it with: python3 -m pip install python-iso639"
+            "Install python-iso639 into the Mergerz Python environment to enable localized language names."
         ) from exc
 
     cached = _ocr_capability_cache_matches(installed_version)
@@ -11416,9 +11851,9 @@ def _plugin_status():
         return result
 
     packages = manifest.get("packages") or {}
-    required_packages = {"paddleocr", "onnxruntime"}
+    required_packages = {"paddleocr", "paddlepaddle", "onnxruntime"}
     if "onnxruntime-gpu" in packages:
-        required_packages = {"paddleocr", "onnxruntime-gpu"}
+        required_packages = {"paddleocr", "paddlepaddle", "onnxruntime-gpu"}
     if set(name.lower() for name in packages) != required_packages:
         result["reason"] = "OCR plugin manifest has an unexpected package set. Reinstall the plugin."
         return result
@@ -11613,8 +12048,9 @@ class PluginTaskThread(QtCore.QThread):
 
 
 class _PluginInstallerTask:
-    def __init__(self, plugin_id):
+    def __init__(self, plugin_id, python_selection=None):
         self.plugin_id = plugin_id
+        self.python_selection = str(python_selection or _get_python_runtime_selection(plugin_id)).strip().lower()
         self._proc = None
 
     def cancel(self):
@@ -11657,72 +12093,50 @@ class _PluginInstallerTask:
             raise RuntimeError(f"Command failed with exit code {rc}: {' '.join(cmd)}")
 
     def _create_venv(self, worker, root):
-        self._run_proc(
-            worker,
-            [sys.executable, "-m", "venv", os.path.join(root, "venv")],
-            cwd=root,
-            env=os.environ.copy(),
-            label="Creating OCR VM...",
+        pyexe, runtime = _create_python_plugin_venv(
+            worker, root, OCR_PLUGIN_ID, self.python_selection, self._run_proc
         )
-        pyexe = _ocr_venv_python(root)
-        if not os.path.isfile(pyexe):
-            raise RuntimeError("The isolated virtual environment was created without a usable Python executable.")
-        cp = _run_capture([pyexe, "-m", "ensurepip", "--upgrade"], env=_plugin_env(root), timeout=180)
-        if cp.returncode == 0:
-            worker.log("Bundled pip bootstrap completed.", "success")
-        else:
-            worker.log("ensurepip is unavailable; checking for an existing pip module.", "warning")
-        cp = _run_capture([pyexe, "-m", "pip", "--version"], env=_plugin_env(root), timeout=60)
-        if cp.returncode != 0:
-            raise RuntimeError("The isolated Python environment does not provide pip.")
-        worker.log(cp.stdout.strip(), "info")
-        return pyexe
+        worker.log("Created the isolated Python environment; UV will manage all packages.", "success")
+        return pyexe, runtime
 
-    def _pip_base(self, pyexe):
-        return [
-            pyexe,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--only-binary=:all:",
-            "--prefer-binary",
-        ]
+    def _uv_install_base(self, pyexe):
+        return _uv_package_command("install", pyexe, ("--only-binary=:all:",))
 
     def run(self, worker):
-        runtime = _current_runtime_info()
-        plan = _ocr_package_plan(runtime, gpu=False)
+        _require_uv_for_package_operations(worker, self.python_selection)
         parent = _ocr_plugin_root()
         os.makedirs(parent, exist_ok=True)
         staging = os.path.join(parent, "staging_" + uuid.uuid4().hex)
         os.makedirs(staging, exist_ok=True)
         worker.set_infinite(True, "Preparing OCR")
         worker.log("Mergerz OCR plugin installer", "success")
-        worker.log(f"OS: {runtime['os']} {runtime['os_release']}", "info")
-        worker.log(f"Architecture: {runtime['machine']} ({runtime['bits']}-bit)", "info")
-        worker.log(f"Python: {runtime['python']}", "info")
-        worker.log("CPU OCR baseline: ONNX Runtime", "success")
-        worker.log("Libraries: " + ", ".join(plan["packages"]), "info")
         try:
-            pyexe = self._create_venv(worker, staging)
+            pyexe, runtime = self._create_venv(worker, staging)
+            plan = _ocr_package_plan(runtime, gpu=False)
+            worker.log(f"OS: {runtime['os']} {runtime['os_release']}", "info")
+            worker.log(f"Architecture: {runtime['machine']} ({runtime['bits']}-bit)", "info")
+            worker.log(f"Python: {runtime['python']} ({'UV-managed ' + self.python_selection if self.python_selection != _PYTHON_RUNTIME_CURRENT else 'current Mergerz interpreter'})", "info")
+            worker.log("CPU OCR baseline: ONNX Runtime", "success")
+            worker.log("Libraries: " + ", ".join(plan["packages"]), "info")
             env = _plugin_env(staging)
-            base = self._pip_base(pyexe)
+            base = self._uv_install_base(pyexe)
             self._run_proc(
                 worker,
                 base + ["--dry-run", "--upgrade"] + plan["packages"],
                 cwd=staging,
-                env=env,
-                label="Installing dependencies...",
+                env=_uv_operation_env(env),
+                label="Resolving OCR dependencies...",
             )
             self._run_proc(
                 worker,
                 base + ["--upgrade"] + plan["packages"],
                 cwd=staging,
-                env=env,
+                env=_uv_operation_env(env),
                 label="Installing dependencies...",
             )
+            _uv_check_environment(worker, self, pyexe, env=env, cwd=staging)
             _write_plugin_runner(staging)
-            versions = _package_versions_in_venv(pyexe, ["paddleocr", "onnxruntime"])
+            versions = _package_versions_in_venv(pyexe, ["paddleocr", "paddlepaddle", "onnxruntime"])
             worker.set_infinite(True, "Fetching OCR languages and models...")
             worker.log("Fetching OCR languages and models...", "info")
             language_info = _fetch_ocr_languages_from_plugin(staging, worker=worker)
@@ -11754,6 +12168,8 @@ class _PluginInstallerTask:
                     "version": runtime["python"],
                     "machine": runtime["machine"],
                     "implementation": runtime["implementation"],
+                    "selection": self.python_selection,
+                    "source": "uv-managed" if self.python_selection != _PYTHON_RUNTIME_CURRENT else "current",
                 },
                 "platform": {
                     "system": runtime["os"],
@@ -11943,7 +12359,8 @@ class _LibreOfficeUninstallerTask:
 
 class _Pdf2DocxInstallerTask:
     """Install PDF2DOCX into its own isolated virtual environment and verify it."""
-    def __init__(self):
+    def __init__(self, python_selection=None):
+        self.python_selection = str(python_selection or _get_python_runtime_selection(PDF2DOCX_PLUGIN_ID)).strip().lower()
         self._proc = None
 
     def cancel(self):
@@ -11982,66 +12399,48 @@ class _Pdf2DocxInstallerTask:
             raise RuntimeError(f"Command failed with exit code {rc}: {' '.join(cmd)}")
 
     def _create_venv(self, worker, root):
-        self._run_proc(
-            worker,
-            [sys.executable, "-m", "venv", os.path.join(root, "venv")],
-            cwd=root, env=os.environ.copy(), label="Creating PDF2DOCX VM...",
+        pyexe, runtime = _create_python_plugin_venv(
+            worker, root, PDF2DOCX_PLUGIN_ID, self.python_selection, self._run_proc
         )
-        pyexe = _pdf2docx_venv_python(root)
-        if not os.path.isfile(pyexe):
-            raise RuntimeError("The isolated PDF2DOCX Python environment was not created correctly.")
-        cp = _run_capture([pyexe, "-m", "ensurepip", "--upgrade"],
-                          env=_pdf2docx_plugin_env(root), timeout=180)
-        if cp.returncode == 0:
-            worker.log("Bundled pip bootstrap completed.", "success")
-        else:
-            worker.log("ensurepip is unavailable; checking for an existing pip module.", "warning")
-        cp = _run_capture([pyexe, "-m", "pip", "--version"],
-                          env=_pdf2docx_plugin_env(root), timeout=60)
-        if cp.returncode != 0:
-            raise RuntimeError("The isolated PDF2DOCX environment does not provide pip.")
-        worker.log(cp.stdout.strip(), "info")
-        return pyexe
+        worker.log("Created the isolated Python environment; UV will manage all packages.", "success")
+        return pyexe, runtime
 
-    def _pip_base(self, pyexe):
-        return [
-            pyexe, "-m", "pip", "install", "--disable-pip-version-check",
-            "--prefer-binary",
-        ]
+    def _uv_install_base(self, pyexe):
+        return _uv_package_command("install", pyexe)
 
     def run(self, worker):
-        runtime = _current_runtime_info()
-        if runtime["implementation"] != "CPython":
-            raise RuntimeError("The PDF2DOCX plugin requires CPython.")
-        py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
-        if py < PDF2DOCX_PLUGIN_PYTHON_MIN:
-            raise RuntimeError("The PDF2DOCX plugin requires Python 3.10 or newer.")
-        if runtime["bits"] != 64:
-            raise RuntimeError("The PDF2DOCX plugin requires a 64-bit Python runtime.")
-
+        _require_uv_for_package_operations(worker, self.python_selection)
         parent = _pdf2docx_plugin_root()
         os.makedirs(parent, exist_ok=True)
         staging = os.path.join(parent, "staging_" + uuid.uuid4().hex)
         os.makedirs(staging, exist_ok=True)
         worker.set_infinite(True, "Preparing PDF2DOCX")
         worker.log("Mergerz PDF2DOCX plugin installer", "success")
-        worker.log(f"OS: {runtime['os']} {runtime['os_release']}", "info")
-        worker.log(f"Architecture: {runtime['machine']} ({runtime['bits']}-bit)", "info")
-        worker.log(f"Python: {runtime['python']}", "info")
-        worker.log("Library: PDF2DOCX", "success")
         try:
-            pyexe = self._create_venv(worker, staging)
+            pyexe, runtime = self._create_venv(worker, staging)
+            py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
+            if runtime["implementation"] != "CPython":
+                raise RuntimeError("The PDF2DOCX plugin requires CPython.")
+            if py < PDF2DOCX_PLUGIN_PYTHON_MIN:
+                raise RuntimeError("The PDF2DOCX plugin requires Python 3.10 or newer.")
+            if runtime["bits"] != 64:
+                raise RuntimeError("The PDF2DOCX plugin requires a 64-bit Python runtime.")
+            worker.log(f"OS: {runtime['os']} {runtime['os_release']}", "info")
+            worker.log(f"Architecture: {runtime['machine']} ({runtime['bits']}-bit)", "info")
+            worker.log(f"Python: {runtime['python']} ({'UV-managed ' + self.python_selection if self.python_selection != _PYTHON_RUNTIME_CURRENT else 'current Mergerz interpreter'})", "info")
+            worker.log("Library: PDF2DOCX", "success")
             env = _pdf2docx_plugin_env(staging)
-            base = self._pip_base(pyexe)
-            # Deliberately unpinned: pip resolves the latest available compatible PDF2DOCX.
+            base = self._uv_install_base(pyexe)
+            # Deliberately unpinned: UV resolves the latest available compatible PDF2DOCX.
             self._run_proc(
                 worker, base + ["--dry-run", "pdf2docx"],
-                cwd=staging, env=env, label="Installing dependencies...",
+                cwd=staging, env=_uv_operation_env(env), label="Resolving PDF2DOCX dependencies...",
             )
             self._run_proc(
                 worker, base + ["--upgrade", "pdf2docx"],
-                cwd=staging, env=env, label="Installing dependencies...",
+                cwd=staging, env=_uv_operation_env(env), label="Installing dependencies...",
             )
+            _uv_check_environment(worker, self, pyexe, env=env, cwd=staging)
             _write_pdf2docx_runner(staging)
             self._run_proc(
                 worker, [pyexe, _pdf2docx_runner_path(staging), "--verify"],
@@ -12057,6 +12456,8 @@ class _Pdf2DocxInstallerTask:
                     "version": runtime["python"],
                     "machine": runtime["machine"],
                     "implementation": runtime["implementation"],
+                    "selection": self.python_selection,
+                    "source": "uv-managed" if self.python_selection != _PYTHON_RUNTIME_CURRENT else "current",
                 },
                 "platform": {
                     "system": runtime["os"],
@@ -12077,8 +12478,10 @@ class _Pdf2DocxInstallerTask:
 
 class _OCRUpdateTask:
     """Stage and activate a previously confirmed OCR update without rechecking online."""
-    def __init__(self, update_info=None):
+    def __init__(self, update_info=None, python_selection=None):
         self.update_info = dict(update_info or {})
+        default_selection = _get_installed_python_runtime_selection(OCR_PLUGIN_ID)
+        self.python_selection = str(python_selection or default_selection).strip().lower()
         self._proc = None
 
     def cancel(self):
@@ -12117,7 +12520,7 @@ class _OCRUpdateTask:
         if not status.get("healthy"):
             raise RuntimeError(status.get("reason") or "OCR plugin is not ready for update.")
         installed = {str(name): str(version) for name, version in (status.get("libraries") or []) if version}
-        packages = ["paddleocr"]
+        packages = ["paddleocr", "paddlepaddle"]
         if "onnxruntime-gpu" in installed:
             packages.append("onnxruntime-gpu")
         else:
@@ -12142,10 +12545,7 @@ class _OCRUpdateTask:
                 worker.log("No update available for OCR.", "success")
                 return {"ok": True, "no_update": True, "plugin": "OCR", "current_versions": installed, "latest_versions": latest}
 
-        runtime = _current_runtime_info()
-        py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
-        if runtime["implementation"] != "CPython" or py < OCR_PYTHON_MIN or py > OCR_PYTHON_MAX[:2] or runtime["bits"] != 64:
-            raise RuntimeError("The current Python runtime is not supported for an OCR update.")
+        _require_uv_for_package_operations(worker, self.python_selection)
         parent = _ocr_plugin_root()
         os.makedirs(parent, exist_ok=True)
         staging = os.path.join(parent, "staging_update_" + uuid.uuid4().hex)
@@ -12153,19 +12553,21 @@ class _OCRUpdateTask:
         use_gpu = bool((status.get("gpu_support") or {}).get("installed"))
         try:
             worker.set_infinite(True, "Preparing OCR update")
-            self._run_proc(worker, [sys.executable, "-m", "venv", os.path.join(staging, "venv")],
-                           cwd=staging, env=os.environ.copy(), label="Creating OCR VM...")
-            pyexe = _ocr_venv_python(staging)
-            if not os.path.isfile(pyexe):
-                raise RuntimeError("The staged OCR virtual environment was not created correctly.")
-            _run_capture([pyexe, "-m", "ensurepip", "--upgrade"], env=_plugin_env(staging), timeout=180)
+            pyexe, runtime = _create_python_plugin_venv(
+                worker, staging, OCR_PLUGIN_ID, self.python_selection, self._run_proc
+            )
+            _ocr_package_plan(runtime, gpu=use_gpu)
+            py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
+            if runtime["implementation"] != "CPython" or py < OCR_PYTHON_MIN or runtime["bits"] != 64:
+                raise RuntimeError("The selected Python runtime is not supported for an OCR update.")
             env = _plugin_env(staging)
-            base = [pyexe, "-m", "pip", "install", "--disable-pip-version-check", "--only-binary=:all:", "--prefer-binary"]
-            install_specs = ["paddleocr", "onnxruntime-gpu[cuda,cudnn]" if use_gpu else "onnxruntime"]
-            self._run_proc(worker, base + ["--upgrade"] + install_specs, cwd=staging, env=env, label="Installing dependencies...")
+            base = _uv_package_command("install", pyexe, ("--only-binary=:all:",))
+            install_specs = ["paddleocr", "paddlepaddle", "onnxruntime-gpu[cuda,cudnn]" if use_gpu else "onnxruntime"]
+            self._run_proc(worker, base + ["--upgrade"] + install_specs, cwd=staging, env=_uv_operation_env(env), label="Installing dependencies...")
+            _uv_check_environment(worker, self, pyexe, env=env, cwd=staging)
             _write_plugin_runner(staging)
             versions = _package_versions_in_venv(
-                pyexe, ["paddleocr", "onnxruntime-gpu" if use_gpu else "onnxruntime"]
+                pyexe, ["paddleocr", "paddlepaddle", "onnxruntime-gpu" if use_gpu else "onnxruntime"]
             )
             worker.set_infinite(True, "Fetching OCR languages and models...")
             worker.log("Fetching OCR languages and models...", "info")
@@ -12195,11 +12597,13 @@ class _OCRUpdateTask:
                     "version": runtime["python"],
                     "machine": runtime["machine"],
                     "implementation": runtime["implementation"],
+                    "selection": self.python_selection,
+                    "source": "uv-managed" if self.python_selection != _PYTHON_RUNTIME_CURRENT else "current",
                 },
                 "platform": {"system": runtime["os"], "release": runtime["os_release"]},
             })
             if use_gpu:
-                after = _pip_list_in_venv(pyexe, env)
+                after = _uv_list_in_venv(pyexe, env)
                 manifest["gpu_support"] = {
                     "installed": True, "healthy": True, "package": "onnxruntime-gpu",
                     "version": versions.get("onnxruntime-gpu"),
@@ -12225,8 +12629,10 @@ class _OCRUpdateTask:
 
 class _Pdf2DocxUpdateTask:
     """Stage and activate a previously confirmed PDF2DOCX update without rechecking online."""
-    def __init__(self, update_info=None):
+    def __init__(self, update_info=None, python_selection=None):
         self.update_info = dict(update_info or {})
+        default_selection = _get_installed_python_runtime_selection(PDF2DOCX_PLUGIN_ID)
+        self.python_selection = str(python_selection or default_selection).strip().lower()
         self._proc = None
 
     def cancel(self):
@@ -12283,24 +12689,22 @@ class _Pdf2DocxUpdateTask:
                 worker.log("No update available for PDF to DOCX.", "success")
                 return {"ok": True, "no_update": True, "plugin": "PDF2DOCX", "current_version": current, "latest_version": latest}
 
-        runtime = _current_runtime_info()
-        py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
-        if runtime["implementation"] != "CPython" or py < PDF2DOCX_PLUGIN_PYTHON_MIN or runtime["bits"] != 64:
-            raise RuntimeError("The current Python runtime is not supported for a PDF2DOCX update.")
+        _require_uv_for_package_operations(worker, self.python_selection)
         parent = _pdf2docx_plugin_root()
         os.makedirs(parent, exist_ok=True)
         staging = os.path.join(parent, "staging_update_" + uuid.uuid4().hex)
         os.makedirs(staging, exist_ok=True)
         try:
-            self._run_proc(worker, [sys.executable, "-m", "venv", os.path.join(staging, "venv")],
-                           cwd=staging, env=os.environ.copy(), label="Creating PDF2DOCX VM...")
-            pyexe = _pdf2docx_venv_python(staging)
-            if not os.path.isfile(pyexe):
-                raise RuntimeError("The staged PDF2DOCX virtual environment was not created correctly.")
-            _run_capture([pyexe, "-m", "ensurepip", "--upgrade"], env=_pdf2docx_plugin_env(staging), timeout=180)
+            pyexe, runtime = _create_python_plugin_venv(
+                worker, staging, PDF2DOCX_PLUGIN_ID, self.python_selection, self._run_proc
+            )
+            py = tuple(runtime.get("python_tuple") or sys.version_info[:3])[:2]
+            if runtime["implementation"] != "CPython" or py < PDF2DOCX_PLUGIN_PYTHON_MIN or runtime["bits"] != 64:
+                raise RuntimeError("The selected Python runtime is not supported for a PDF2DOCX update.")
             env = _pdf2docx_plugin_env(staging)
-            base = [pyexe, "-m", "pip", "install", "--disable-pip-version-check", "--prefer-binary"]
-            self._run_proc(worker, base + ["--upgrade", "pdf2docx"], cwd=staging, env=env, label="Installing dependencies...")
+            base = _uv_package_command("install", pyexe)
+            self._run_proc(worker, base + ["--upgrade", "pdf2docx"], cwd=staging, env=_uv_operation_env(env), label="Installing dependencies...")
+            _uv_check_environment(worker, self, pyexe, env=env, cwd=staging)
             _write_pdf2docx_runner(staging)
             self._run_proc(worker, [pyexe, _pdf2docx_runner_path(staging), "--verify"],
                            cwd=staging, env=env, label="Testing PDF2DOCX...")
@@ -12317,6 +12721,8 @@ class _Pdf2DocxUpdateTask:
                     "version": runtime["python"],
                     "machine": runtime["machine"],
                     "implementation": runtime["implementation"],
+                    "selection": self.python_selection,
+                    "source": "uv-managed" if self.python_selection != _PYTHON_RUNTIME_CURRENT else "current",
                 },
                 "platform": {"system": runtime["os"], "release": runtime["os_release"]},
             })
@@ -12350,9 +12756,13 @@ class _PluginBatchUpdateTask:
     def _make_task(self, result):
         plugin_id = result.get("plugin_id")
         if plugin_id == OCR_PLUGIN_ID:
-            return _OCRUpdateTask(update_info=result)
+            return _OCRUpdateTask(
+                update_info=result, python_selection=result.get("python_selection")
+            )
         if plugin_id == PDF2DOCX_PLUGIN_ID:
-            return _Pdf2DocxUpdateTask(update_info=result)
+            return _Pdf2DocxUpdateTask(
+                update_info=result, python_selection=result.get("python_selection")
+            )
         if plugin_id == LIBREOFFICE_PLUGIN_ID:
             return _LibreOfficeInstallerTask(update=True, update_info=result)
         raise ValueError(f"Unknown plugin id: {plugin_id}")
@@ -12617,17 +13027,6 @@ class _Pdf2DocxUninstallerTask:
 
 
 
-def _uninstall_packages(worker, task, pyexe, package_names, env, label):
-    names = [n for n in package_names if n]
-    if not names:
-        return
-    task._run_proc(
-        worker,
-        [pyexe, "-m", "pip", "uninstall", "-y"] + names,
-        cwd=os.path.dirname(pyexe),
-        env=env,
-        label=label,
-    )
 
 
 class _PluginGpuSupportTask:
@@ -12674,47 +13073,40 @@ class _PluginGpuSupportTask:
         if rc != 0:
             raise RuntimeError(f"Command failed with exit code {rc}: {' '.join(cmd)}")
 
-    def _pip(self, pyexe):
-        return [
-            pyexe,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--only-binary=:all:",
-            "--prefer-binary",
-        ]
+    def _uv_install(self, pyexe):
+        return _uv_package_command("install", pyexe, ("--only-binary=:all:",))
 
     def _uninstall_ort(self, worker, pyexe, env, extra_names=None):
         names = ["onnxruntime", "onnxruntime-gpu"]
         names.extend(sorted(set(extra_names or [])))
         self._run_proc(
             worker,
-            [pyexe, "-m", "pip", "uninstall", "-y"] + names,
+            _uv_package_command("uninstall", pyexe, tuple(names)),
             cwd=os.path.dirname(pyexe),
-            env=env,
+            env=_uv_operation_env(env),
             label="Replacing ONNX Runtime...",
         )
 
     def _install_cpu(self, worker, pyexe, env):
         self._run_proc(
             worker,
-            self._pip(pyexe) + ["--upgrade", "onnxruntime"],
+            self._uv_install(pyexe) + ["--upgrade", "onnxruntime"],
             cwd=os.path.dirname(pyexe),
-            env=env,
+            env=_uv_operation_env(env),
             label="Restoring CPU ORT...",
         )
 
     def _install_gpu(self, worker, pyexe, env, package):
         self._run_proc(
             worker,
-            self._pip(pyexe) + ["--upgrade", package],
+            self._uv_install(pyexe) + ["--upgrade", package],
             cwd=os.path.dirname(pyexe),
-            env=env,
+            env=_uv_operation_env(env),
             label=f"Installing GPU dependencies...",
         )
 
     def run(self, worker):
+        _require_uv_for_package_operations(worker, _get_python_runtime_selection(OCR_PLUGIN_ID))
         status = _plugin_status()
         if not status.get("healthy"):
             raise RuntimeError(status.get("reason") or "Install the OCR plugin before changing GPU support.")
@@ -12741,20 +13133,21 @@ class _PluginGpuSupportTask:
                 _write_json_atomic(_ocr_manifest_path(root), manifest)
                 return {"ok": True, "status": _plugin_status()}
 
-            before = _pip_list_in_venv(pyexe, env)
+            before = _uv_list_in_venv(pyexe, env)
             try:
                 self._uninstall_ort(worker, pyexe, env)
                 self._install_gpu(worker, pyexe, env, gpu_plan["package"])
+                _uv_check_environment(worker, self, pyexe, env=env, cwd=root)
                 _write_plugin_runner(root)
                 verify_cmd = [pyexe, _ocr_runner_path(root), "--verify", "--prefer-gpu", "--require-gpu"]
                 self._run_proc(worker, verify_cmd, cwd=root, env=env, label="Testing GPU OCR...")
-                after = _pip_list_in_venv(pyexe, env)
+                after = _uv_list_in_venv(pyexe, env)
                 extra = {
                     name: version
                     for name, version in _nvidia_packages(after).items()
                     if name not in _nvidia_packages(before)
                 }
-                versions = _package_versions_in_venv(pyexe, ["paddleocr", "onnxruntime-gpu"])
+                versions = _package_versions_in_venv(pyexe, ["paddleocr", "paddlepaddle", "onnxruntime-gpu"])
                 manifest["packages"] = versions
                 manifest["gpu_support"] = {
                     "installed": True,
@@ -12771,10 +13164,11 @@ class _PluginGpuSupportTask:
                 worker.log("GPU installation failed; restoring CPU OCR...", "warning")
                 rollback_error = None
                 try:
-                    after = _pip_list_in_venv(pyexe, env)
+                    after = _uv_list_in_venv(pyexe, env)
                     gpu_names = set(_nvidia_packages(after)) - set(_nvidia_packages(before))
                     self._uninstall_ort(worker, pyexe, env, sorted(gpu_names))
                     self._install_cpu(worker, pyexe, env)
+                    _uv_check_environment(worker, self, pyexe, env=env, cwd=root, label="Checking restored CPU packages...")
                     _write_plugin_runner(root)
                     self._run_proc(
                         worker,
@@ -12783,7 +13177,7 @@ class _PluginGpuSupportTask:
                         env=env,
                         label="Testing CPU OCR...",
                     )
-                    manifest["packages"] = _package_versions_in_venv(pyexe, ["paddleocr", "onnxruntime"])
+                    manifest["packages"] = _package_versions_in_venv(pyexe, ["paddleocr", "paddlepaddle", "onnxruntime"])
                     manifest["gpu_support"] = {
                         "installed": False,
                         "healthy": False,
@@ -12808,6 +13202,7 @@ class _PluginGpuSupportTask:
         try:
             self._uninstall_ort(worker, pyexe, env, current_gpu_extras.keys())
             self._install_cpu(worker, pyexe, env)
+            _uv_check_environment(worker, self, pyexe, env=env, cwd=root)
             _write_plugin_runner(root)
             self._run_proc(
                 worker,
@@ -12816,7 +13211,7 @@ class _PluginGpuSupportTask:
                 env=env,
                 label="Testing CPU OCR...",
             )
-            cpu_versions = _package_versions_in_venv(pyexe, ["paddleocr", "onnxruntime"])
+            cpu_versions = _package_versions_in_venv(pyexe, ["paddleocr", "paddlepaddle", "onnxruntime"])
             manifest["packages"] = cpu_versions
             manifest["gpu_support"] = {
                 "installed": False,
@@ -12837,6 +13232,7 @@ class _PluginGpuSupportTask:
                 # Deliberately unpinned: restore the latest available compatible GPU runtime.
                 gpu_package = "onnxruntime-gpu[cuda,cudnn]"
                 self._install_gpu(worker, pyexe, env, gpu_package)
+                _uv_check_environment(worker, self, pyexe, env=env, cwd=root, label="Checking restored GPU packages...")
                 _write_plugin_runner(root)
                 self._run_proc(
                     worker,
@@ -12845,7 +13241,7 @@ class _PluginGpuSupportTask:
                     env=env,
                     label="Testing GPU OCR...",
                 )
-                versions = _package_versions_in_venv(pyexe, ["paddleocr", "onnxruntime-gpu"])
+                versions = _package_versions_in_venv(pyexe, ["paddleocr", "paddlepaddle", "onnxruntime-gpu"])
                 manifest["packages"] = versions
                 manifest["gpu_support"] = {
                     "installed": True,
@@ -12914,6 +13310,7 @@ PLUGIN_UPDATE_NAMES = {
 
 PLUGIN_LIBRARY_DISPLAY_NAMES = {
     "paddleocr": "PaddleOCR",
+    "paddlepaddle": "PaddlePaddle",
     "onnxruntime": "ONNX Runtime",
     "onnxruntime-gpu": "ONNX Runtime GPU",
     "pdf2docx": "PDF2DOCX",
@@ -12952,7 +13349,7 @@ def _check_plugin_updates(plugin_id, worker=None):
             for name, version in (status.get("libraries") or [])
             if version
         }
-        packages = ["paddleocr"]
+        packages = ["paddleocr", "paddlepaddle"]
         packages.append(
             "onnxruntime-gpu" if "onnxruntime-gpu" in installed else "onnxruntime"
         )
@@ -13050,6 +13447,347 @@ def _check_plugin_updates(plugin_id, worker=None):
     raise ValueError(f"Unknown plugin id: {plugin_id}")
 
 
+class _UVPackageUpdateCheckTask:
+    """Check PyPI for a newer stable UV package installed in Mergerz's environment."""
+
+    def cancel(self):
+        pass
+
+    def run(self, worker):
+        worker.set_infinite(True, "Checking UV installed in this environment...")
+        current = _uv_current_info()
+        if not current:
+            worker.log("The UV package or its native executable could not be verified in Mergerz's Python environment.", "warning")
+            return {"ok": True, "missing_uv": True}
+
+        worker.log(f"Installed UV version: {current['version']}", "info")
+        worker.set_infinite(True, "Checking for UV updates...")
+        latest = _latest_pypi_release("uv", worker=worker)
+        if not re.fullmatch(r"\d+\.\d+\.\d+", latest):
+            raise RuntimeError(f"PyPI returned an unsupported non-stable UV version: {latest!r}.")
+        worker.log(f"Latest stable UV version on PyPI: {latest}", "info")
+        if _version_is_newer(latest, current["version"]):
+            worker.log(f"UV update available: {current['version']} → {latest}.", "success")
+            return {
+                "ok": True,
+                "update_available": True,
+                "current_version": current["version"],
+                "latest_version": latest,
+            }
+        worker.log(f"UV {current['version']} is up to date.", "success")
+        return {
+            "ok": True,
+            "no_update": True,
+            "current_version": current["version"],
+            "latest_version": latest,
+        }
+
+
+def _uv_remove_path(path):
+    if not path or not os.path.lexists(path):
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+
+def _uv_rewrite_distribution_record(site_packages, package_dir, dist_info, script_paths):
+    """Regenerate wheel RECORD paths/hashes for the package's final install locations."""
+    import base64
+    import csv
+
+    site_packages = os.path.abspath(site_packages)
+    record_path = os.path.join(dist_info, "RECORD")
+    all_paths = []
+    for directory in (package_dir, dist_info):
+        for root, _dirs, files in os.walk(directory):
+            for filename in files:
+                path = os.path.abspath(os.path.join(root, filename))
+                if path != os.path.abspath(record_path) and os.path.isfile(path):
+                    all_paths.append(path)
+    for path in script_paths:
+        path = os.path.abspath(path)
+        if os.path.isfile(path):
+            all_paths.append(path)
+
+    rows = []
+    seen = set()
+    for path in all_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        digest = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        encoded = base64.urlsafe_b64encode(digest.digest()).decode("ascii").rstrip("=")
+        relative = os.path.relpath(path, site_packages).replace(os.sep, "/")
+        rows.append((relative, f"sha256={encoded}", str(os.path.getsize(path))))
+    rows.append((os.path.relpath(record_path, site_packages).replace(os.sep, "/"), "", ""))
+
+    temporary = record_path + ".tmp-" + uuid.uuid4().hex
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh, lineterminator="\n")
+            writer.writerows(rows)
+        os.replace(temporary, record_path)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except Exception:
+                pass
+
+
+def _uv_promote_staged_package(stage, current, target_version):
+    """Promote a staged UV wheel into the current environment with rollback support.
+
+    Staging uses UV itself, but activation happens only after that UV subprocess exits.
+    This avoids trying to replace a running uv.exe on Windows.
+    """
+    site_packages = os.path.abspath(current["site_packages"])
+    staged_package = os.path.join(stage, "uv")
+    metadata_candidates = sorted(
+        path for path in Path(stage).glob("uv-*.dist-info") if path.is_dir()
+    )
+    if not os.path.isdir(staged_package) or len(metadata_candidates) != 1:
+        raise RuntimeError("The staged UV wheel did not contain the expected package and metadata directories.")
+    staged_dist_info = str(metadata_candidates[0])
+    metadata_version = ""
+    try:
+        import importlib.metadata as importlib_metadata
+        metadata = importlib_metadata.PathDistribution(metadata_candidates[0])
+        metadata_version = str(metadata.version or "").strip()
+    except Exception:
+        metadata_path = os.path.join(staged_dist_info, "METADATA")
+        with open(metadata_path, "r", encoding="utf-8", errors="replace") as fh:
+            match = re.search(r"(?im)^Version:\s*(\S+)\s*$", fh.read())
+            metadata_version = match.group(1) if match else ""
+    if metadata_version != target_version:
+        raise RuntimeError(
+            f"The staged UV wheel version is {metadata_version or 'unknown'}, expected {target_version}."
+        )
+
+    exe_name = "uv.exe" if os.name == "nt" else "uv"
+    uvx_name = "uvx.exe" if os.name == "nt" else "uvx"
+    # uv's `--target` install places native scripts beside the target's package
+    # tree under `bin/` (including on Windows); also accept `Scripts/` in case a
+    # platform-specific installer layout uses the regular Windows scheme.
+    staged_script_dirs = [os.path.join(stage, "bin")]
+    if os.name == "nt":
+        staged_script_dirs.append(os.path.join(stage, "Scripts"))
+    staged_uv = next(
+        (os.path.join(directory, exe_name) for directory in staged_script_dirs
+         if os.path.isfile(os.path.join(directory, exe_name))),
+        None,
+    )
+    staged_uvx = next(
+        (os.path.join(directory, uvx_name) for directory in staged_script_dirs
+         if os.path.isfile(os.path.join(directory, uvx_name))),
+        None,
+    )
+    if not staged_uv:
+        raise RuntimeError("The staged UV wheel did not provide its native UV executable.")
+    cp = _run_capture([staged_uv, "--version"], timeout=15)
+    output = "\n".join(part for part in (cp.stdout, cp.stderr) if part)
+    staged_version = _uv_parse_version(output)
+    if cp.returncode != 0 or staged_version != target_version:
+        raise RuntimeError(
+            f"The staged UV executable failed verification: expected {target_version}, "
+            f"got {staged_version or output.strip() or cp.returncode}."
+        )
+    if current.get("uvx_executable") and not os.path.isfile(staged_uvx):
+        raise RuntimeError("The staged UV wheel did not provide uvx, so the existing installation was left unchanged.")
+
+    target_package = current["package_dir"]
+    target_dist_info = os.path.join(site_packages, os.path.basename(staged_dist_info))
+    target_uv = current["executable"]
+    target_uvx = current.get("uvx_executable") or os.path.join(current["scripts_dir"], uvx_name)
+    staged_targets = [
+        (staged_package, target_package, "directory"),
+        (staged_dist_info, target_dist_info, "directory"),
+        (staged_uv, target_uv, "file"),
+    ]
+    if os.path.isfile(staged_uvx):
+        staged_targets.append((staged_uvx, target_uvx, "file"))
+
+    # Backup every existing path that may be replaced. Sibling backups stay on the
+    # same filesystem as their destination, including user installs with separate
+    # site-packages and scripts directories.
+    backup_paths = []
+    temp_script_paths = []
+    promoted_paths = []
+    backup_candidates = [
+        current["package_dir"], current["dist_info"], target_dist_info,
+        target_uv, target_uvx,
+    ]
+    try:
+        for target in dict.fromkeys(os.path.abspath(path) for path in backup_candidates if path):
+            if os.path.lexists(target):
+                backup = target + ".mergerz-backup-" + uuid.uuid4().hex
+                os.replace(target, backup)
+                backup_paths.append((target, backup))
+
+        for source, destination, kind in staged_targets:
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            if kind == "file":
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=".mergerz-uv-new-", dir=os.path.dirname(destination)
+                )
+                os.close(fd)
+                temp_script_paths.append(temp_path)
+                shutil.copy2(source, temp_path)
+                if os.name != "nt":
+                    os.chmod(temp_path, 0o755)
+                os.replace(temp_path, destination)
+                promoted_paths.append(destination)
+                temp_script_paths.remove(temp_path)
+            else:
+                os.replace(source, destination)
+                promoted_paths.append(destination)
+
+        _uv_rewrite_distribution_record(
+            site_packages,
+            target_package,
+            target_dist_info,
+            [target_uv, target_uvx],
+        )
+        verified = _uv_current_info()
+        if not verified or verified["version"] != target_version:
+            raise RuntimeError("The updated UV package failed verification after activation; rolling back.")
+
+        for _original, backup in backup_paths:
+            try:
+                _uv_remove_path(backup)
+            except Exception:
+                pass
+        return verified
+    except Exception:
+        for temp_path in temp_script_paths:
+            try:
+                _uv_remove_path(temp_path)
+            except Exception:
+                pass
+        for destination in reversed(promoted_paths):
+            try:
+                _uv_remove_path(destination)
+            except Exception:
+                pass
+        rollback_errors = []
+        for original, backup in reversed(backup_paths):
+            try:
+                if os.path.lexists(backup):
+                    if os.path.lexists(original):
+                        _uv_remove_path(original)
+                    os.replace(backup, original)
+            except Exception as exc:
+                rollback_errors.append(f"{original}: {exc}")
+        if rollback_errors:
+            raise RuntimeError(
+                "UV update activation failed and one or more backups could not be restored: "
+                + "; ".join(rollback_errors)
+            )
+        raise
+
+
+class _UVPackageUpdateTask:
+    """Stage and activate a UV package update in Mergerz's current environment."""
+
+    def __init__(self, target_version):
+        self.target_version = str(target_version or "").strip()
+        self._proc = None
+
+    def cancel(self):
+        # UV package activation updates the package manager itself; no mid-update
+        # cancellation is exposed by the UI and the subprocess is allowed to finish.
+        pass
+
+    def _run_proc(self, worker, command, label):
+        worker.set_cancel_enabled(False, "Updating UV; cancellation is disabled...")
+        worker.set_infinite(True, label)
+        worker.log(label, "info")
+        env = _uv_operation_env(os.environ.copy())
+        env["PYTHONUNBUFFERED"] = "1"
+        kwargs = {
+            "cwd": os.getcwd(),
+            "env": env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        else:
+            kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(command, **kwargs)
+        try:
+            for line in iter(self._proc.stdout.readline, ""):
+                if line:
+                    worker.log(line.rstrip("\r\n"), "info")
+            code = self._proc.wait()
+        finally:
+            self._proc = None
+        if code != 0:
+            raise RuntimeError(f"UV package staging failed with exit code {code}.")
+
+    def run(self, worker):
+        current = _require_uv_for_package_operations(worker)
+        target = self.target_version
+        if not re.fullmatch(r"\d+\.\d+\.\d+", target):
+            raise ValueError("The requested UV update is not a stable three-part release version.")
+        if not _version_is_newer(target, current["version"]):
+            return {
+                "ok": True,
+                "no_update": True,
+                "plugin": "UV",
+                "current_version": current["version"],
+                "latest_version": target,
+                "summary": f"UV {current['version']} is already up to date.",
+            }
+
+        site_packages = current["site_packages"]
+        os.makedirs(site_packages, exist_ok=True)
+        stage = tempfile.mkdtemp(prefix=".mergerz-uv-update-", dir=site_packages)
+        try:
+            worker.log(
+                f"Updating UV {current['version']} → {target} in {sys.executable}.",
+                "info",
+            )
+            command = _uv_package_command(
+                "install",
+                sys.executable,
+                (
+                    "--target", stage,
+                    "--no-deps",
+                    "--only-binary=:all:",
+                    f"uv=={target}",
+                ),
+            )
+            self._run_proc(worker, command, f"Staging UV {target} from PyPI...")
+            worker.set_infinite(True, "Verifying and activating the staged UV package...")
+            installed = _uv_promote_staged_package(stage, current, target)
+            worker.log(
+                f"UV {installed['version']} was updated and verified in the Mergerz Python environment.",
+                "success",
+            )
+            return {
+                "ok": True,
+                "version": installed["version"],
+                "summary": (
+                    f"UV was updated to {installed['version']} and verified successfully.\n\n"
+                    f"Python environment: {sys.executable}\n"
+                    f"Package location: {installed['dist_info']}"
+                ),
+            }
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
 class _PluginUpdateCheckTask:
     def __init__(self, plugin_id):
         self.plugin_id = str(plugin_id)
@@ -13076,7 +13814,7 @@ class _PluginUpdateCheckTask:
 
 
 def _installed_mergerz_version():
-    """Return the version of the installed Mergerz distribution in normal/package mode."""
+    """Return the installed Mergerz distribution version used by the updater."""
     try:
         import importlib.metadata as importlib_metadata
         version = str(importlib_metadata.version("mergerz") or "").strip()
@@ -13135,7 +13873,7 @@ class _MergerzUpdateInstallTask:
         worker.set_infinite(True, str(label))
         worker.log(str(label), "info")
 
-        env = os.environ.copy()
+        env = _uv_operation_env(os.environ.copy())
         env["PYTHONUNBUFFERED"] = "1"
         kwargs = {
             "cwd": os.getcwd(),
@@ -13187,35 +13925,70 @@ class _MergerzUpdateInstallTask:
         )
         worker.log(f"Python environment: {sys.executable}", "info")
 
-        command = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "--disable-pip-version-check",
-            "--no-input",
-            f"mergerz=={self.target_version}",
-        ]
-        self._run_proc(
-            worker,
-            command,
-            f"Installing Mergerz {self.target_version}...",
+        uv = _require_uv_for_package_operations(worker)
+        worker.log(f"Package manager: UV {uv['version']}", "info")
+        command = _uv_package_command(
+            "install", sys.executable,
+            (f"mergerz=={self.target_version}",),
         )
-
+        install_attempted = False
         try:
-            import importlib.metadata as importlib_metadata
-            installed = str(importlib_metadata.version("mergerz") or "").strip()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Mergerz was installed, but the installed version could not be verified: {exc}"
-            ) from exc
-
-        if installed != self.target_version:
-            raise RuntimeError(
-                f"Mergerz update verification failed: expected {self.target_version}, "
-                f"but the environment reports {installed or 'unknown'}."
+            install_attempted = True
+            self._run_proc(
+                worker,
+                command,
+                f"Installing Mergerz {self.target_version} with UV...",
             )
+            try:
+                import importlib.metadata as importlib_metadata
+                installed = str(importlib_metadata.version("mergerz") or "").strip()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Mergerz was installed, but the installed version could not be verified: {exc}"
+                ) from exc
+
+            # Verify the running environment's installed distribution independently
+            # through UV's package inspector before requesting a restart. Do not make the
+            # application update depend on `uv pip check` for every unrelated package in
+            # a user's shared Python environment; plugin environments are checked separately.
+            uv_list = _uv_list_in_venv(sys.executable, env=_uv_operation_env())
+            uv_installed = uv_list.get("mergerz")
+            if installed != self.target_version or uv_installed != self.target_version:
+                raise RuntimeError(
+                    f"Mergerz update verification failed: expected {self.target_version}, "
+                    f"but importlib reports {installed or 'unknown'} and UV reports {uv_installed or 'unknown'}."
+                )
+        except Exception as update_exc:
+            if not install_attempted:
+                raise
+            # Even if distribution metadata still reports the previous version, an
+            # interrupted wheel installation may have replaced some files before failing.
+            # Reinstall the exact previous version rather than trusting metadata alone.
+            worker.log("Mergerz update failed; attempting to restore the previous version...", "warning")
+            try:
+                rollback_command = _uv_package_command(
+                    "install", sys.executable,
+                    ("--reinstall", f"mergerz=={current_version}"),
+                )
+                self._run_proc(worker, rollback_command, f"Restoring Mergerz {current_version}...")
+                import importlib.metadata as importlib_metadata
+                restored = str(importlib_metadata.version("mergerz") or "").strip()
+                uv_list_after_rollback = _uv_list_in_venv(
+                    sys.executable, env=_uv_operation_env()
+                )
+                uv_restored = uv_list_after_rollback.get("mergerz")
+                if restored != current_version or uv_restored != current_version:
+                    raise RuntimeError(
+                        f"Expected restored version {current_version}, found importlib={restored or 'unknown'} "
+                        f"and UV={uv_restored or 'unknown'}."
+                    )
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"Mergerz update failed: {update_exc}; rollback to {current_version} also failed: {rollback_exc}"
+                ) from update_exc
+            raise RuntimeError(
+                f"Mergerz update failed and the previous version {current_version} was restored: {update_exc}"
+            ) from update_exc
 
         worker.log(
             f"Mergerz {installed} was installed and verified successfully.",
@@ -13317,7 +14090,26 @@ class PluginsScanThread(QtCore.QThread):
                 for future in as_completed(futures):
                     key = futures[future]
                     statuses[key] = future.result()
-            self.result_signal.emit({key: statuses.get(key, {}) for key, _ in checks})
+            result = {key: statuses.get(key, {}) for key, _ in checks}
+            # Read actual venv interpreter versions on this worker thread. Older plugin
+            # manifests predate the Python-runtime metadata added by Mergerz, so manifest
+            # fields alone are not sufficient to show their real runtimes.
+            for status_key in ("ocr", "pdf2docx"):
+                plugin_status = result.get(status_key) or {}
+                python_executable = str(plugin_status.get("python") or "")
+                if python_executable and os.path.isfile(python_executable):
+                    try:
+                        plugin_status["python_runtime"] = _probe_plugin_python_for_display(
+                            python_executable
+                        )
+                    except Exception:
+                        # Preserve manifest metadata as a fallback; an unavailable probe
+                        # should not make an otherwise readable Plugins page fail to load.
+                        pass
+            # Populate runtime menus from the UV package installed with Mergerz;
+            # this is a Python-build catalogue query, not a UV self-update check.
+            result["python_runtime_catalog"] = _python_runtime_catalog_for_ui()
+            self.result_signal.emit(result)
         except Exception as exc:
             self.error_signal.emit(f"{type(exc).__name__}: {exc}")
 
@@ -15480,18 +16272,65 @@ class _ThumbnailGridDelegate(QtWidgets.QStyledItemDelegate):
             min(view_image_w, max(24, card.width() - 6)),
             view_image_h,
         )
-        if isinstance(icon, QtGui.QIcon) and not icon.isNull():
-            if is_cut:
-                painter.setOpacity(0.4)
-            pm = icon.pixmap(icon_rect.size(), QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off)
-            if not pm.isNull():
-                scaled = pm.scaled(
-                    icon_rect.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                    QtCore.Qt.TransformationMode.SmoothTransformation)
-                px = icon_rect.left() + (icon_rect.width() - scaled.width()) // 2
-                py = icon_rect.top() + (icon_rect.height() - scaled.height()) // 2
-                painter.drawPixmap(px, py, scaled)
-            painter.setOpacity(1.0)
+
+        # QIcon.paint() does not reliably enlarge a raster icon beyond its
+        # available source-pixmap size. At low thumbnail DPI and low grid
+        # density (e.g. one page per row), this leaves the page tiny in a very
+        # large image slot. Draw the actual cached QPixmap into an explicit
+        # aspect-fitted target rectangle instead. QPainter maps the source
+        # pixels to that logical target rect, avoiding QIcon's native-size
+        # behavior and the device-pixel-ratio shrinkage caused by manually
+        # drawing a scaled pixmap at x/y on Windows.
+        thumbnail_pixmap = None
+        thumbnail_cache = getattr(view, "_thumbnail_pixmap_cache", None)
+        if isinstance(thumbnail_cache, dict):
+            candidate = thumbnail_cache.get(data.get("uid"))
+            if isinstance(candidate, QtGui.QPixmap) and not candidate.isNull():
+                thumbnail_pixmap = candidate
+
+        # Retain a safe fallback for any item whose pixmap is not present in the
+        # Edit PDF session's shared thumbnail cache.
+        if thumbnail_pixmap is None and isinstance(icon, QtGui.QIcon) and not icon.isNull():
+            try:
+                available_sizes = icon.availableSizes(
+                    QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off)
+                if available_sizes:
+                    source_size = max(
+                        available_sizes,
+                        key=lambda size: int(size.width()) * int(size.height()))
+                    thumbnail_pixmap = icon.pixmap(
+                        source_size, QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off)
+                else:
+                    thumbnail_pixmap = icon.pixmap(
+                        icon_rect.size(), QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.Off)
+            except Exception:
+                thumbnail_pixmap = None
+
+        if isinstance(thumbnail_pixmap, QtGui.QPixmap) and not thumbnail_pixmap.isNull():
+            source_width = int(thumbnail_pixmap.width())
+            source_height = int(thumbnail_pixmap.height())
+            target_width = max(1, int(icon_rect.width()))
+            target_height = max(1, int(icon_rect.height()))
+            if source_width > 0 and source_height > 0:
+                # Fit either width or height, preserve the page's full aspect
+                # ratio, and center it on both axes. This also scales *up* when
+                # the source thumbnail is smaller than the available slot.
+                scale = min(
+                    target_width / float(source_width),
+                    target_height / float(source_height),
+                )
+                draw_width = max(1, min(target_width, int(round(source_width * scale))))
+                draw_height = max(1, min(target_height, int(round(source_height * scale))))
+                draw_rect = QtCore.QRect(
+                    icon_rect.left() + (target_width - draw_width) // 2,
+                    icon_rect.top() + (target_height - draw_height) // 2,
+                    draw_width,
+                    draw_height,
+                )
+                if is_cut:
+                    painter.setOpacity(0.4)
+                painter.drawPixmap(draw_rect, thumbnail_pixmap, thumbnail_pixmap.rect())
+                painter.setOpacity(1.0)
 
         placeholder_row = getattr(view, "_placeholder_row", -1)
         current_num = index.row() + 1
@@ -15840,9 +16679,13 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
         self._navigation_anchor_uid = None
         self._recalculating_geometry = False
         self._last_geometry_key = None
-        self._grid_safety_reserve = 4
+        self._grid_safety_reserve = 0
         self._grid_verify_pending = False
         self._grid_verify_attempts = 0
+        # Keep the page at the top of the viewport anchored when thumbnail density
+        # changes. QListView reflows rows as items-per-row changes, and its default
+        # pixel-scroll preservation can make zoom controls appear to scroll the grid.
+        self._zoom_scroll_anchor_generation = 0
 
         # The viewport width can change when the vertical scrollbar appears/disappears
         # after changing the density. Listen to the real viewport resize so geometry
@@ -15888,6 +16731,95 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
                 border: 1px solid #3a3a3a;
                 border-radius: 8px;
                 padding: 0px;
+            }
+
+            /* Replace platform-native scrollbar painting with the same clean,
+               dark track on Windows and Linux. Style every scrollbar subcontrol
+               so the Windows native track/line textures cannot bleed through. */
+            QListWidget QScrollBar:vertical {
+                background: #1a1a1a;
+                width: 10px;
+                margin: 0px;
+                border: none;
+            }
+            QListWidget QScrollBar::groove:vertical {
+                background: #1a1a1a;
+                margin: 0px;
+                border: none;
+            }
+            QListWidget QScrollBar::handle:vertical {
+                background: #444444;
+                min-height: 30px;
+                margin: 1px;
+                border: none;
+                border-radius: 4px;
+            }
+            QListWidget QScrollBar::handle:vertical:hover {
+                background: #555555;
+            }
+            QListWidget QScrollBar::add-line:vertical,
+            QListWidget QScrollBar::sub-line:vertical {
+                height: 0px;
+                width: 0px;
+                background: transparent;
+                border: none;
+            }
+            QListWidget QScrollBar::up-arrow:vertical,
+            QListWidget QScrollBar::down-arrow:vertical {
+                height: 0px;
+                width: 0px;
+                background: transparent;
+                border: none;
+            }
+            QListWidget QScrollBar::add-page:vertical,
+            QListWidget QScrollBar::sub-page:vertical {
+                background: #1a1a1a;
+                border: none;
+            }
+
+            QListWidget QScrollBar:horizontal {
+                height: 10px;
+                background: #1a1a1a;
+                margin: 0px;
+                border: none;
+            }
+            QListWidget QScrollBar::groove:horizontal {
+                background: #1a1a1a;
+                margin: 0px;
+                border: none;
+            }
+            QListWidget QScrollBar::handle:horizontal {
+                background: #444444;
+                min-width: 30px;
+                margin: 1px;
+                border: none;
+                border-radius: 4px;
+            }
+            QListWidget QScrollBar::handle:horizontal:hover {
+                background: #555555;
+            }
+            QListWidget QScrollBar::add-line:horizontal,
+            QListWidget QScrollBar::sub-line:horizontal {
+                height: 0px;
+                width: 0px;
+                background: transparent;
+                border: none;
+            }
+            QListWidget QScrollBar::left-arrow:horizontal,
+            QListWidget QScrollBar::right-arrow:horizontal {
+                height: 0px;
+                width: 0px;
+                background: transparent;
+                border: none;
+            }
+            QListWidget QScrollBar::add-page:horizontal,
+            QListWidget QScrollBar::sub-page:horizontal {
+                background: #1a1a1a;
+                border: none;
+            }
+            QListWidget QAbstractScrollArea::corner {
+                background: #1a1a1a;
+                border: none;
             }
         """)
         QtCore.QTimer.singleShot(0, self._recalculate_grid_geometry)
@@ -15959,11 +16891,106 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
 
     def set_items_per_row(self, value):
         value = max(1, min(10, int(value)))
-        if value != self._items_per_row:
-            self._grid_safety_reserve = 4
-            self._grid_verify_attempts = 0
+        if value == self._items_per_row:
+            self._recalculate_grid_geometry()
+            return
+
+        # Preserve the first visible row by its page number, not by its previous
+        # pixel offset. A density change necessarily changes row heights and
+        # item positions, so pixel-offset anchoring can make zoom feel like an
+        # unintended scroll. The row's first visible item is the stable anchor.
+        anchor = self._capture_zoom_top_row_anchor()
+        self._grid_safety_reserve = 0
+        self._grid_verify_attempts = 0
         self._items_per_row = value
         self._recalculate_grid_geometry()
+
+        # Reapply after Qt lays out the new rows and again after the grid's
+        # cross-platform column-fit verification has had a chance to adjust cell
+        # geometry. Generation guards prevent a stale zoom from overriding a
+        # more recent slider/button change.
+        self._zoom_scroll_anchor_generation += 1
+        generation = self._zoom_scroll_anchor_generation
+        self._restore_zoom_top_row_anchor(anchor, generation)
+        for delay_ms in (0, 40):
+            QtCore.QTimer.singleShot(
+                delay_ms,
+                lambda a=anchor, g=generation: self._restore_zoom_top_row_anchor(a, g),
+            )
+
+    def _capture_zoom_top_row_anchor(self):
+        """Capture the first visible row's page number before thumbnail reflow."""
+        bar = self.verticalScrollBar()
+        fallback = {"item": None, "page_number": None, "scroll_value": int(bar.value())}
+        try:
+            viewport_rect = self.viewport().rect()
+            candidates = []
+            for index in range(self.count()):
+                item = self.item(index)
+                if item is None:
+                    continue
+                rect = self.visualItemRect(item)
+                if (not rect.isValid() or rect.isNull()
+                        or not rect.intersects(viewport_rect)):
+                    continue
+                # The grid flows left-to-right, so the topmost, leftmost visible
+                # item identifies the page row the user is currently looking at.
+                candidates.append((int(rect.top()), int(rect.left()), index, item))
+            if candidates:
+                _top, _left, index, item = min(candidates, key=lambda entry: entry[:3])
+                # The displayed order number is index + 1. Preserve it explicitly
+                # so restoration is based on the same page number, not a stale
+                # vertical pixel coordinate. Keep the item as a fallback.
+                return {
+                    "item": item,
+                    "page_number": index + 1,
+                    "scroll_value": int(bar.value()),
+                }
+        except Exception:
+            pass
+        return fallback
+
+    def _restore_zoom_top_row_anchor(self, anchor, generation):
+        """Place the same anchored page row at the top after a density change."""
+        if generation != getattr(self, "_zoom_scroll_anchor_generation", -1):
+            return
+        if not isinstance(anchor, dict):
+            return
+        bar = self.verticalScrollBar()
+        item = anchor.get("item")
+        try:
+            # Resolve the same displayed page number after reflow. The item
+            # reference is a fallback in case the list changed while queued work
+            # was waiting to run.
+            page_number = anchor.get("page_number")
+            try:
+                page_number = int(page_number)
+            except (TypeError, ValueError):
+                page_number = 0
+            if 1 <= page_number <= self.count():
+                item = self.item(page_number - 1)
+
+            # Layout must be current before asking Qt to scroll to the page. The
+            # PositionAtTop hint anchors the whole row, rather than restoring an
+            # arbitrary pixel offset within a partially clipped row.
+            self.doItemsLayout()
+            if item is not None and self.row(item) >= 0:
+                self.scrollToItem(
+                    item,
+                    QtWidgets.QAbstractItemView.ScrollHint.PositionAtTop,
+                )
+                rect = self.visualItemRect(item)
+                if rect.isValid() and not rect.isNull():
+                    # Correct any residual pixel rounding so the anchored row
+                    # starts exactly at the viewport's top edge.
+                    delta = int(rect.top())
+                    if delta:
+                        bar.setValue(bar.value() + delta)
+                return
+            # Empty grids or a removed anchor have no row to preserve.
+            bar.setValue(int(anchor.get("scroll_value", bar.value())))
+        except (RuntimeError, TypeError, ValueError):
+            pass
 
     def set_page_aspect_ratio(self, aspect_ratio):
         try:
@@ -15973,7 +17000,7 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
         if not math.isfinite(ratio) or ratio <= 0:
             ratio = 1.0
         self._thumb_aspect_ratio = max(0.08, min(12.0, ratio))
-        self._grid_safety_reserve = 4
+        self._grid_safety_reserve = 0
         self._grid_verify_attempts = 0
         self._recalculate_grid_geometry()
 
@@ -15989,11 +17016,11 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
             n = max(1, min(10, int(self._items_per_row)))
             ratio_key = round(float(self._thumb_aspect_ratio), 6)
 
-            # Reserve only a tiny, deliberate amount of outer breathing room.
-            # Qt's IconMode flow has a few style/rounding boundaries of its own;
-            # giving it a tiny integer-safe reserve prevents a mathematically
-            # exact boundary from turning N columns into N-1. The reserve is
-            # deliberately constant and tiny, not a per-column gap.
+            # Start without a fixed outer reserve so the final card sits closer
+            # to the scrollbar instead of leaving an unnecessary right-side gap.
+            # Qt's IconMode layout can wrap at a platform-specific integer/style
+            # boundary; _verify_column_fit adds only the minimum reserve needed
+            # if the requested number of columns would otherwise wrap early.
             outer_reserve = min(24, max(0, viewport_width - 1), int(self._grid_safety_reserve))
             usable_width = max(n, viewport_width - outer_reserve)
             cell_width = max(1, usable_width // n)
@@ -16070,7 +17097,7 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
             QtCore.QTimer.singleShot(0, self._finalize_population_layout)
             return
 
-        self._grid_safety_reserve = 4
+        self._grid_safety_reserve = 0
         self._grid_verify_attempts = 0
         self._grid_verify_pending = False
         self._last_geometry_key = None
@@ -16149,7 +17176,7 @@ class ThumbnailGrid(_SingleClickDeselectMixin, QtWidgets.QListWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._update_empty_grid_tip()
-        self._grid_safety_reserve = 4
+        self._grid_safety_reserve = 0
         self._grid_verify_attempts = 0
         QtCore.QTimer.singleShot(0, self._recalculate_grid_geometry)
 
@@ -16850,9 +17877,29 @@ class _SearchWorker(QtCore.QObject):
                     try:
                         page = doc.load_page(i)
                         rects = page.search_for(query)
+
+                        # Search rectangles are returned in PyMuPDF's unrotated
+                        # page coordinate space, but _LazyPdfView paints highlights
+                        # in the same displayed coordinate space as page.get_pixmap()
+                        # and _pdf_page_words_in_display_space(). Convert each hit
+                        # with the page rotation matrix before sending it to the GUI.
+                        # Subtract page.rect's origin as well, so pages with offset
+                        # CropBox/MediaBox coordinates line up with the rendered page.
+                        page_rect = fitz.Rect(page.rect)
+                        rotation_matrix = page.rotation_matrix
+                        origin_x = float(page_rect.x0)
+                        origin_y = float(page_rect.y0)
                         for r in rects:
-                            results.append((i, float(r.x0), float(r.y0),
-                                            float(r.x1), float(r.y1)))
+                            displayed = fitz.Rect(r) * rotation_matrix
+                            x0 = float(displayed.x0 - origin_x)
+                            y0 = float(displayed.y0 - origin_y)
+                            x1 = float(displayed.x1 - origin_x)
+                            y1 = float(displayed.y1 - origin_y)
+                            results.append((
+                                i,
+                                min(x0, x1), min(y0, y1),
+                                max(x0, x1), max(y0, y1),
+                            ))
                     except Exception:
                         pass
         except Exception:
@@ -17570,9 +18617,10 @@ class _PdfZoomSlider(_ThumbnailDensitySlider):
 
 
 class _PdfZoomFooter(QtWidgets.QWidget):
-    """Shared viewer footer: zoom-out, percentage slider, zoom-in, and Fit Width."""
+    """Shared zoom footer; the full PDF viewer may also expose its Pan toggle."""
     def __init__(self, zoom_getter, zoom_in_callback, zoom_out_callback,
-                 zoom_percent_callback, fit_callback=None, parent=None):
+                 zoom_percent_callback, fit_callback=None, parent=None,
+                 pan_callback=None):
         super().__init__(parent)
         self._zoom_getter = zoom_getter
         self._zoom_percent_callback = zoom_percent_callback
@@ -17614,6 +18662,18 @@ class _PdfZoomFooter(QtWidgets.QWidget):
                 "fit.svg", "Fit Width (Ctrl+0)", fit_callback)
             row.addWidget(self.fit_btn)
 
+        # Pan is intentionally available only when explicitly requested by the
+        # Full PDF Viewer; crop and selected-page viewers keep their existing footer.
+        self.pan_btn = None
+        if pan_callback is not None:
+            self.pan_btn = self._make_button(
+                "pan.svg", "Pan (Hold space)", lambda: None)
+            self.pan_btn.setCheckable(True)
+            self.pan_btn.setAccessibleName("Pan")
+            self.pan_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            self.pan_btn.toggled.connect(pan_callback)
+            row.addWidget(self.pan_btn)
+
         self.set_zoom_factor(float(self._zoom_getter()), emit=False)
 
     def _make_button(self, icon_name, tooltip, callback):
@@ -17635,6 +18695,7 @@ class _PdfZoomFooter(QtWidgets.QWidget):
             }
             QPushButton:hover { background:#3a3a3a; }
             QPushButton:pressed { background:#4a4a4a; }
+            QPushButton:checked { background:#0a3a5c; border:1px solid #0078d7; }
             QPushButton:disabled { background:#1e1e1e; border:1px solid #2a2a2a; }
         """)
         button.clicked.connect(lambda *_args, _callback=callback: _callback())
@@ -19578,6 +20639,10 @@ class _LazyPdfView(QtWidgets.QWidget):
         self._exact_word_text = ""
         self._pressed_link = None
 
+        self._pan_mode_active = False
+        self._pan_dragging = False
+        self._pan_last_global_pos = None
+
         self._search_hits_by_page = {}
         self._current_hit = None
 
@@ -19647,6 +20712,22 @@ class _LazyPdfView(QtWidgets.QWidget):
     def bookmarks(self):
         """Return the PDF outline entries used by the Full PDF Viewer bookmark pane."""
         return list(self._bookmarks)
+
+    def set_pan_mode_active(self, active):
+        """Enable/disable drag-to-pan while suppressing text and link selection."""
+        active = bool(active)
+        if active == self._pan_mode_active:
+            return
+        self._pan_mode_active = active
+        if active:
+            self.clear_selection()
+            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+        elif not self._pan_dragging:
+            try:
+                self._update_hover_cursor(self.mapFromGlobal(QtGui.QCursor.pos()))
+            except Exception:
+                self.setCursor(QtCore.Qt.CursorShape.IBeamCursor)
+        self.update()
 
     def _load_bookmarks(self):
         """Read the PDF's native outline/bookmark tree without changing the document."""
@@ -20155,6 +21236,9 @@ class _LazyPdfView(QtWidgets.QWidget):
         return True
 
     def mouseDoubleClickEvent(self, event):
+        if self._pan_mode_active:
+            event.accept()
+            return
         if event.button() == QtCore.Qt.MouseButton.LeftButton and self._select_word_at(_qt_event_position(event)):
             self._pressed_link = None
             self._double_click_word_selected = True
@@ -20164,6 +21248,17 @@ class _LazyPdfView(QtWidgets.QWidget):
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
+        if (self._pan_mode_active
+                and event.button() == QtCore.Qt.MouseButton.LeftButton):
+            self._pan_dragging = True
+            self._pan_last_global_pos = _qt_event_global_position(event)
+            self._pressed_link = None
+            self._press_origin = None
+            self._drag_started = False
+            self._sel_active = False
+            self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
             return
         self._pressed_link = self._link_at(_qt_event_position(event))
@@ -20182,6 +21277,25 @@ class _LazyPdfView(QtWidgets.QWidget):
         self._exact_word_text = ""
 
     def mouseMoveEvent(self, event):
+        if self._pan_dragging:
+            current_global = _qt_event_global_position(event)
+            previous_global = self._pan_last_global_pos or current_global
+            dx = current_global.x() - previous_global.x()
+            dy = current_global.y() - previous_global.y()
+            self._pan_last_global_pos = current_global
+            scroll_area = self._find_scroll_area()
+            if scroll_area is not None:
+                hbar = scroll_area.horizontalScrollBar()
+                vbar = scroll_area.verticalScrollBar()
+                hbar.setValue(hbar.value() - dx)
+                vbar.setValue(vbar.value() - dy)
+            self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if self._pan_mode_active:
+            self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
         if self._press_origin is None:
             self._update_hover_cursor(_qt_event_position(event))
             return
@@ -20204,7 +21318,19 @@ class _LazyPdfView(QtWidgets.QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._pan_dragging and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._pan_dragging = False
+            self._pan_last_global_pos = None
+            if self._pan_mode_active:
+                self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+            else:
+                self._update_hover_cursor(_qt_event_position(event))
+            event.accept()
+            return
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        if self._pan_mode_active:
+            event.accept()
             return
         pressed_link = self._pressed_link
         self._pressed_link = None
@@ -21432,6 +22558,18 @@ class FullPdfViewer(QtWidgets.QDialog):
 
         self._threads_shutdown = False
 
+        # Pan can be latched with the footer button or temporarily activated by
+        # holding Space while the PDF canvas has focus. Temporary activation never
+        # changes the button's checked state.
+        self._pan_latched = False
+        self._pan_shortcut_active = False
+        self._pan_space_down = False
+        self._pan_hold_timer = QtCore.QTimer(self)
+        self._pan_hold_timer.setSingleShot(True)
+        self._pan_hold_timer.setInterval(150)
+        self._pan_hold_timer.timeout.connect(self._activate_temporary_pan)
+        self._pan_event_filter_installed = False
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -21620,6 +22758,7 @@ class FullPdfViewer(QtWidgets.QDialog):
             self._set_zoom_percent,
             self._fit_width,
             self,
+            pan_callback=self._on_pan_button_toggled,
         )
         bottom.addWidget(self._zoom_footer)
         bottom.addStretch()
@@ -21687,10 +22826,144 @@ class FullPdfViewer(QtWidgets.QDialog):
             self._search_worker.finished.connect(self._on_search_finished)
             self._search_thread.start()
 
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._pan_event_filter_installed = True
+
+    def _widget_is_within_viewer(self, widget):
+        current = widget
+        while current is not None:
+            if current is self:
+                return True
+            try:
+                current = current.parentWidget()
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
+    def _widget_is_within(widget, ancestor):
+        current = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            try:
+                current = current.parentWidget()
+            except Exception:
+                return False
+        return False
+
+    def _activate_temporary_pan(self):
+        """Activate temporary pan only after Space has been held briefly."""
+        if (not self._pan_space_down or not self.isVisible()
+                or self._threads_shutdown):
+            return
+        self._pan_shortcut_active = True
+        self._sync_pan_mode()
+
+    def eventFilter(self, watched, event):
+        """Temporarily enable pan by holding Space while the PDF canvas has focus."""
+        try:
+            event_type = event.type()
+
+            if event_type == QtCore.QEvent.Type.WindowDeactivate and watched is self:
+                self._pan_hold_timer.stop()
+                self._pan_space_down = False
+                self._pan_shortcut_active = False
+                self._sync_pan_mode()
+                return False
+
+            if (not self._pan_event_filter_installed or not self.isVisible()
+                    or not self._widget_is_within_viewer(watched)):
+                return super().eventFilter(watched, event)
+
+            key = getattr(event, "key", lambda: None)()
+            if key != QtCore.Qt.Key.Key_Space:
+                return super().eventFilter(watched, event)
+
+            app = QtWidgets.QApplication.instance()
+            focus_widget = app.focusWidget() if app is not None else None
+            focus_in_canvas = (
+                self.view is not None
+                and self._widget_is_within(focus_widget, self.view)
+            )
+
+            if event_type == QtCore.QEvent.Type.KeyPress:
+                # Do not steal Space from search boxes, buttons, or other controls.
+                # While Space is already held, swallow auto-repeat so it cannot
+                # trigger the viewer's normal page-scroll behavior.
+                if self._pan_space_down:
+                    event.accept()
+                    return True
+                if event.isAutoRepeat() or not focus_in_canvas:
+                    return super().eventFilter(watched, event)
+                self._pan_space_down = True
+                self._pan_hold_timer.start()
+                # Reserve this key press while checking whether it becomes a hold.
+                event.accept()
+                return True
+
+            if event_type == QtCore.QEvent.Type.KeyRelease and self._pan_space_down:
+                # Qt synthesizes autorepeat as alternating KeyPress/KeyRelease
+                # events while a key remains physically held. An autorepeat
+                # release is not the user's real release: keep temporary Pan
+                # active until a non-autorepeat Space release arrives.
+                if event.isAutoRepeat():
+                    event.accept()
+                    return True
+                self._pan_hold_timer.stop()
+                self._pan_space_down = False
+                self._pan_shortcut_active = False
+                self._sync_pan_mode()
+                event.accept()
+                return True
+        except Exception:
+            # Input tracking must never break ordinary PDF viewer interactions.
+            pass
+        return super().eventFilter(watched, event)
+
+    def _on_pan_button_toggled(self, checked):
+        # Button clicks control only persistent/latching pan mode. Space-hold is
+        # temporary and must not force the button into its checked visual state.
+        self._pan_latched = bool(checked)
+        self._sync_pan_mode()
+        if self.view is not None:
+            self.view.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _sync_pan_mode(self):
+        active = bool(self._pan_latched or self._pan_shortcut_active)
+        footer = getattr(self, "_zoom_footer", None)
+        button = getattr(footer, "pan_btn", None) if footer is not None else None
+        # Reflect only the persistent button toggle, not temporary Space-hold mode.
+        if button is not None and button.isChecked() != bool(self._pan_latched):
+            old = button.blockSignals(True)
+            button.setChecked(bool(self._pan_latched))
+            button.blockSignals(old)
+        if self.view is not None:
+            self.view.set_pan_mode_active(active)
+
+    def _remove_pan_event_filter(self):
+        if not self._pan_event_filter_installed:
+            return
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+        self._pan_event_filter_installed = False
+        self._pan_hold_timer.stop()
+        self._pan_space_down = False
+        self._pan_shortcut_active = False
+        self._pan_latched = False
+        self._sync_pan_mode()
+
     def _shutdown_threads(self):
         if self._threads_shutdown:
             return
         self._threads_shutdown = True
+        self._remove_pan_event_filter()
 
         search_thread = self._search_thread
         search_worker = self._search_worker
@@ -22007,6 +23280,8 @@ class FullPdfViewer(QtWidgets.QDialog):
         _open_external_pdf_link(uri)
 
     def _on_view_context_menu(self, pos):
+        if self._pan_shortcut_active:
+            return
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -23014,6 +24289,17 @@ class CropBoxDialog(QtWidgets.QDialog):
 
         if flip_h or flip_v:
             qpix = _flip_qpixmap(qpix, flip_h, flip_v)
+
+        # Keep the crop preview consistent with the live Edit PDF thumbnail/viewer when a
+        # filter has been selected but no Page Design anchor exists. The anchored Page Design
+        # branch above already renders the exact PDF-native filter stack, so only this raster
+        # path needs the fast preview approximation. Image-only inversion deliberately remains
+        # unapplied here because a flattened preview cannot distinguish image pixels from vectors.
+        filter_config = _entry_filter_config(item)
+        if _filter_config_active(filter_config):
+            preview_config = _fast_pixel_preview_filter_config(filter_config)
+            if _filter_config_active(preview_config):
+                qpix = _apply_filter_to_qpixmap(qpix, preview_config)
 
         if keep_box:
             self._canvas.update_content_keep_box(
@@ -31516,13 +32802,6 @@ def _page_numbering_insert_on_page(page, config, overlay=True):
         raise RuntimeError(f"PyMuPDF could not place page number {cfg['number']} on the page.")
 
 
-def _page_numbering_preview_config_for_entry(entry, config):
-    cfg = dict(config)
-    existing = _page_numbering_entry_config(entry)
-    if existing is not None:
-        # Keep the current preview's explicit number, but take style from the live dialog.
-        cfg["number"] = int(config.get("number", existing["number"]))
-    return _page_numbering_normalize_config(cfg)
 
 
 def _render_page_numbering_source_qimage(entry, zoom=1.0, exact_filters=False):
@@ -31665,56 +32944,6 @@ def _render_page_numbering_exact_qimage(entry, config, zoom=1.0):
                 pass
 
 
-def _apply_page_numbering_to_pdf(pdf_path, entries, progress=None):
-    """Bake stored per-entry page numbers into a completed PDF in one atomic pass."""
-    path = os.path.abspath(str(pdf_path or ""))
-    if not path or not os.path.isfile(path):
-        raise FileNotFoundError("The PDF to number does not exist.")
-    entries = list(entries or [])
-    configs = [_page_numbering_entry_config(e) for e in entries]
-    if not any(configs):
-        return False
-    import tempfile as _tempfile
-    fd, candidate = _tempfile.mkstemp(prefix="mergerz_pagenum_", suffix=".pdf", dir=os.path.dirname(path) or TEMP_FOLDER)
-    os.close(fd)
-    doc = None
-    try:
-        doc = fitz.open(path)
-        if doc.page_count != len(entries):
-            raise RuntimeError(
-                f"Page-numbering verification failed: document has {doc.page_count} pages but editor has {len(entries)} entries.")
-        for index, cfg in enumerate(configs):
-            if cfg is None:
-                continue
-            page = doc.load_page(index)
-            _page_numbering_insert_on_page(page, cfg, overlay=True)
-            if progress is not None:
-                try:
-                    progress.append_log(
-                        f"  Page {index + 1}/{len(entries)} numbered as {cfg['number']}", "info")
-                    QtWidgets.QApplication.processEvents(
-                        QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 10)
-                except Exception:
-                    pass
-        doc.save(candidate, garbage=4, deflate=True)
-        doc.close(); doc = None
-        # Verification: reopen and ensure the resulting page count is unchanged.
-        with fitz.open(candidate) as check:
-            if check.page_count != len(entries):
-                raise RuntimeError("Page-numbering changed the output page count unexpectedly.")
-        os.replace(candidate, path)
-        return True
-    finally:
-        try:
-            if doc is not None:
-                doc.close()
-        except Exception:
-            pass
-        try:
-            if os.path.isfile(candidate):
-                os.remove(candidate)
-        except Exception:
-            pass
 
 
 def _page_numbering_pil_draw(image, config, image_dpi):
@@ -32151,12 +33380,41 @@ def _page_design_normalize_border(config):
         radius = max(0.0, min(_PAGE_DESIGN_MAX_RADIUS_PCT, float(config.get("radius", 0.0))))
     except Exception:
         radius = 0.0
-    margins = {}
+    # Keep custom edge distances separately from the effective margins used by renderers.
+    # This preserves a user's custom values while Equal mode is active and disabled in the UI.
+    raw_margins = config.get("custom_margins")
+    if not isinstance(raw_margins, dict):
+        raw_margins = config.get("margins") or {}
+    custom_margins = {}
     for side in ("left", "top", "right", "bottom"):
         try:
-            margins[side] = max(0.0, min(30.0, float((config.get("margins") or {}).get(side, _PAGE_DESIGN_BORDER_DEFAULT_MARGINS[side]))))
+            custom_margins[side] = max(
+                0.0, min(30.0, float(raw_margins.get(side, _PAGE_DESIGN_BORDER_DEFAULT_MARGINS[side])))
+            )
         except Exception:
-            margins[side] = _PAGE_DESIGN_BORDER_DEFAULT_MARGINS[side]
+            custom_margins[side] = _PAGE_DESIGN_BORDER_DEFAULT_MARGINS[side]
+
+    distance_type = str(config.get("distance_type") or "").strip().lower()
+    try:
+        equal_distance = max(0.0, min(30.0, float(config.get("equal_distance", custom_margins["left"]))))
+    except Exception:
+        equal_distance = _PAGE_DESIGN_BORDER_DEFAULT_MARGINS["left"]
+
+    if distance_type not in {"equal", "custom"}:
+        # Backward compatibility: old designs with identical edge values become Equal;
+        # unequal legacy values remain Custom so their appearance does not change.
+        old_values = [custom_margins[side] for side in ("left", "right", "top", "bottom")]
+        if max(old_values) - min(old_values) <= 0.05:
+            distance_type = "equal"
+            equal_distance = old_values[0]
+        else:
+            distance_type = "custom"
+
+    if distance_type == "equal":
+        margins = {side: equal_distance for side in ("left", "right", "top", "bottom")}
+    else:
+        margins = dict(custom_margins)
+
     sides = {}
     raw_sides = config.get("sides") or {}
     for side in ("left", "top", "right", "bottom"):
@@ -32169,6 +33427,10 @@ def _page_design_normalize_border(config):
         "color": _page_design_color(config.get("color"), _PAGE_DESIGN_BORDER_DEFAULT_COLOR),
         "opacity": opacity,
         "radius": radius,
+        "distance_type": distance_type,
+        "equal_distance": equal_distance,
+        "custom_margins": custom_margins,
+        # All drawing/export paths consume this effective margin dictionary.
         "margins": margins,
         "sides": sides,
         "overlay": bool(config.get("overlay", True)),
@@ -32190,9 +33452,16 @@ def _page_design_comparable_config(entry):
     if numbering is not None:
         numbering = dict(numbering)
         numbering.pop("number", None)
+    border = _page_design_border_entry_config(entry)
+    if border is not None and border.get("distance_type") == "equal":
+        # Custom edge values are intentionally dormant in Equal mode. They remain in
+        # the stored config for switching back to Custom, but should not make visually
+        # identical Equal-mode designs compare as different.
+        border = dict(border)
+        border.pop("custom_margins", None)
     return {
         "page_numbering": numbering,
-        "page_border": _page_design_border_entry_config(entry),
+        "page_border": border,
         "page_watermark": _page_design_watermark_entry_config(entry),
     }
 
@@ -32369,32 +33638,6 @@ def _page_design_watermark_patch_qimage_for_config(config, zoom):
     )
 
 
-def _page_design_rounded_polyline_points(rect, radius):
-    x0, y0, x1, y1 = rect.x0, rect.y0, rect.x1, rect.y1
-    if radius <= 0:
-        return [fitz.Point(x0, y0), fitz.Point(x1, y0), fitz.Point(x1, y1), fitz.Point(x0, y1)]
-    radius = min(float(radius), rect.width / 2.0, rect.height / 2.0)
-    k = 0.5522847498307936
-    pts = []
-    def arc(cx, cy, start, stop):
-        import math as _m
-        n = 6
-        for i in range(n + 1):
-            a = _m.radians(start + (stop - start) * (i / n))
-            pts.append(fitz.Point(cx + radius * _m.cos(a), cy + radius * _m.sin(a)))
-    # clockwise in visible-page coordinates
-    pts.append(fitz.Point(x0 + radius, y0))
-    pts.append(fitz.Point(x1 - radius, y0))
-    arc(x1 - radius, y0 + radius, -90, 0)
-    pts.append(fitz.Point(x1, y1 - radius))
-    arc(x1 - radius, y1 - radius, 0, 90)
-    pts.append(fitz.Point(x0 + radius, y1))
-    arc(x0 + radius, y1 - radius, 90, 180)
-    pts.append(fitz.Point(x0, y0 + radius))
-    arc(x0 + radius, y0 + radius, 180, 270)
-    if pts:
-        pts.append(fitz.Point(pts[0].x, pts[0].y))
-    return pts
 
 
 def _page_design_transform_visible_points(page, points):
@@ -32402,18 +33645,6 @@ def _page_design_transform_visible_points(page, points):
     return [pt * matrix for pt in points]
 
 
-def _page_design_border_rect(page, cfg, inset_extra=0.0):
-    vr = fitz.Rect(page.rect)
-    m = cfg.get("margins") or _PAGE_DESIGN_BORDER_DEFAULT_MARGINS
-    left = vr.width * float(m.get("left", 0.0)) / 100.0 + inset_extra
-    right = vr.width * float(m.get("right", 0.0)) / 100.0 + inset_extra
-    top = vr.height * float(m.get("top", 0.0)) / 100.0 + inset_extra
-    bottom = vr.height * float(m.get("bottom", 0.0)) / 100.0 + inset_extra
-    x0 = min(vr.x1, vr.x0 + left)
-    x1 = max(vr.x0, vr.x1 - right)
-    y0 = min(vr.y1, vr.y0 + top)
-    y1 = max(vr.y0, vr.y1 - bottom)
-    return fitz.Rect(x0, y0, x1, y1)
 
 
 
@@ -32804,25 +34035,6 @@ def _page_design_geometry_state(entry_or_state):
     }
 
 
-def _page_design_states_equal(a, b):
-    a = _page_design_geometry_state(a)
-    b = _page_design_geometry_state(b)
-    try:
-        same_stretch = (
-            (a["stretch_ratio"] is None and b["stretch_ratio"] is None)
-            or (a["stretch_ratio"] is not None and b["stretch_ratio"] is not None
-                and math.isclose(float(a["stretch_ratio"]), float(b["stretch_ratio"]),
-                                 rel_tol=1e-12, abs_tol=1e-14))
-        )
-    except (TypeError, ValueError, OverflowError):
-        same_stretch = a["stretch_ratio"] == b["stretch_ratio"]
-    return (
-        a["rotation"] == b["rotation"]
-        and a["crop"] == b["crop"]
-        and a["flip_h"] == b["flip_h"]
-        and a["flip_v"] == b["flip_v"]
-        and same_stretch
-    )
 
 
 def _page_design_filter_state_equal(a, b):
@@ -34370,6 +35582,22 @@ class _PageDesignExactPreviewThread(QtCore.QThread):
 class PageDesignDialog(QtWidgets.QDialog):
     """Professional unified page-design editor with one live preview surface."""
 
+    # Muted styling for the inactive Equal/Custom distance fields. Use a stylesheet
+    # instead of child QGraphicsOpacityEffects: the Border panel itself uses an
+    # opacity effect when disabled, and nested effects cause repeated QPainter errors.
+    _DISTANCE_DISABLED_STYLE = """
+        QDoubleSpinBox[pageDesignDistanceField="true"][pageDesignDistanceMuted="true"]:disabled {
+            color: #666666;
+            background-color: #1e1e1e;
+            border: 1px solid #2b2b2b;
+        }
+        QDoubleSpinBox[pageDesignDistanceField="true"][pageDesignDistanceMuted="true"]::up-button:disabled,
+        QDoubleSpinBox[pageDesignDistanceField="true"][pageDesignDistanceMuted="true"]::down-button:disabled {
+            background: transparent;
+            border: none;
+        }
+    """
+
     _TAB_STYLE = """
         QTabWidget::pane { border: none; background: #0f0f0f; }
         QTabBar::tab {
@@ -34391,6 +35619,7 @@ class PageDesignDialog(QtWidgets.QDialog):
 
     def __init__(self, owner, selected_entries, anchor_index=0, parent=None):
         super().__init__(parent or owner)
+        self.setStyleSheet(self._DISTANCE_DISABLED_STYLE)
         self.owner = owner
         normalized = []
         for entry in selected_entries or []:
@@ -34838,9 +36067,9 @@ class PageDesignDialog(QtWidgets.QDialog):
         _frame, card = self._card(controls_layout, "Position")
         position_row = QtWidgets.QHBoxLayout()
         position_row.setContentsMargins(0, 0, 0, 0)
-        position_row.setSpacing(8)
+        position_row.setSpacing(4)
         x_label = QtWidgets.QLabel("X:")
-        x_label.setMinimumWidth(16)
+        x_label.setFixedWidth(16)
         self.number_x_spin = _SettingsDoubleSpinBox()
         self.number_x_spin.setRange(0.0, 100.0)
         self.number_x_spin.setDecimals(2)
@@ -34849,7 +36078,7 @@ class PageDesignDialog(QtWidgets.QDialog):
         self.number_x_spin.setLocale(ENGLISH_LOCALE)
         self.number_x_spin.setFixedWidth(96)
         y_label = QtWidgets.QLabel("Y:")
-        y_label.setMinimumWidth(16)
+        y_label.setFixedWidth(16)
         self.number_y_spin = _SettingsDoubleSpinBox()
         self.number_y_spin.setRange(0.0, 100.0)
         self.number_y_spin.setDecimals(2)
@@ -34859,7 +36088,8 @@ class PageDesignDialog(QtWidgets.QDialog):
         self.number_y_spin.setFixedWidth(96)
         position_row.addWidget(x_label)
         position_row.addWidget(self.number_x_spin)
-        position_row.addStretch(1)
+        # Keep X and Y controls together; a stretch here creates an oversized
+        # empty gap between the two coordinate fields on wider panels.
         position_row.addWidget(y_label)
         position_row.addWidget(self.number_y_spin)
         card.addLayout(position_row)
@@ -34874,8 +36104,13 @@ class PageDesignDialog(QtWidgets.QDialog):
         start_row = QtWidgets.QHBoxLayout()
         self.start_radio = QtWidgets.QRadioButton("Start from:")
         self.dummy_radio = QtWidgets.QRadioButton("Follow current dummy")
-        self.start_spin = _SettingsSpinBox()
+        # Use QDoubleSpinBox with zero decimals so this integer-only control shares
+        # the same native stepper/arrow appearance as the Position X/Y fields.
+        # DARK_QSS styles QSpinBox separately and makes its arrows inconsistent.
+        self.start_spin = _SettingsDoubleSpinBox()
         self.start_spin.setRange(1, 999999999)
+        self.start_spin.setDecimals(0)
+        self.start_spin.setSingleStep(1.0)
         self.start_spin.setLocale(ENGLISH_LOCALE)
         self.start_spin.setFixedWidth(105)
         start_row.addWidget(self.start_radio)
@@ -34986,26 +36221,73 @@ class PageDesignDialog(QtWidgets.QDialog):
         self.border_color_btn.clicked.connect(self._choose_border_color)
 
         _frame, card = self._card(controls_layout, "Distance from page edges")
+
+        distance_type_row = QtWidgets.QHBoxLayout()
+        distance_type_row.addWidget(QtWidgets.QLabel("Distance type"))
+        self.border_distance_type = QtWidgets.QComboBox()
+        self.border_distance_type.addItem("Equal", "equal")
+        self.border_distance_type.addItem("Custom", "custom")
+        self.border_distance_type.setToolTip(
+            "Use one distance for all four edges, or configure each edge separately."
+        )
+        self.border_distance_type.currentIndexChanged.connect(self._border_distance_type_changed)
+        distance_type_row.addWidget(self.border_distance_type, 1)
+        card.addLayout(distance_type_row)
+
+        # Keep both distance modes visible at all times. The inactive mode is muted
+        # rather than hidden so the user can always see which controls are available
+        # when switching modes.
+        self.border_equal_controls = QtWidgets.QWidget()
+        self.border_equal_controls.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, False)
+        equal_distance_row = QtWidgets.QHBoxLayout(self.border_equal_controls)
+        equal_distance_row.setContentsMargins(0, 0, 0, 0)
+        equal_distance_row.setSpacing(8)
+        equal_distance_label = QtWidgets.QLabel("Equal distance")
+        equal_distance_label.setStyleSheet("QLabel { background: transparent; border: none; }")
+        equal_distance_row.addWidget(equal_distance_label)
+        self.border_equal_distance = _SettingsDoubleSpinBox()
+        self.border_equal_distance.setProperty("pageDesignDistanceField", True)
+        self.border_equal_distance.setRange(0.0, 30.0)
+        self.border_equal_distance.setDecimals(1)
+        self.border_equal_distance.setSingleStep(0.5)
+        self.border_equal_distance.setFixedWidth(80)
+        self.border_equal_distance.setSuffix(" %")
+        self.border_equal_distance.setLocale(ENGLISH_LOCALE)
+        self.border_equal_distance.valueChanged.connect(lambda *_: self._design_changed("border"))
+        equal_distance_row.addWidget(self.border_equal_distance)
+        equal_distance_row.addStretch(1)
+        card.addWidget(self.border_equal_controls)
+
+        self.border_custom_controls = QtWidgets.QWidget()
+        self.border_custom_controls.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, False)
+        custom_controls_layout = QtWidgets.QVBoxLayout(self.border_custom_controls)
+        custom_controls_layout.setContentsMargins(0, 0, 0, 0)
+        custom_controls_layout.setSpacing(0)
         margins_grid = QtWidgets.QGridLayout()
+        margins_grid.setContentsMargins(0, 0, 0, 0)
+        margins_grid.setHorizontalSpacing(8)
+        margins_grid.setVerticalSpacing(6)
         self.border_margin = {}
         for side in ("left", "right", "top", "bottom"):
             spin = _SettingsDoubleSpinBox()
+            spin.setProperty("pageDesignDistanceField", True)
             spin.setRange(0.0, 30.0)
             spin.setDecimals(1)
             spin.setSingleStep(0.5)
+            spin.setFixedWidth(80)
             spin.setSuffix(" %")
             spin.setLocale(ENGLISH_LOCALE)
             spin.valueChanged.connect(lambda *_: self._design_changed("border"))
             self.border_margin[side] = spin
-        margins_grid.addWidget(QtWidgets.QLabel("Left"), 0, 0)
-        margins_grid.addWidget(self.border_margin["left"], 0, 1)
-        margins_grid.addWidget(QtWidgets.QLabel("Right"), 0, 2)
-        margins_grid.addWidget(self.border_margin["right"], 0, 3)
-        margins_grid.addWidget(QtWidgets.QLabel("Top"), 1, 0)
-        margins_grid.addWidget(self.border_margin["top"], 1, 1)
-        margins_grid.addWidget(QtWidgets.QLabel("Bottom"), 1, 2)
-        margins_grid.addWidget(self.border_margin["bottom"], 1, 3)
-        card.addLayout(margins_grid)
+        for side, row, col in (("Left", 0, 0), ("Right", 0, 2), ("Top", 1, 0), ("Bottom", 1, 2)):
+            label = QtWidgets.QLabel(side)
+            label.setStyleSheet("QLabel { background: transparent; border: none; }")
+            margins_grid.addWidget(label, row, col)
+            margins_grid.addWidget(
+                self.border_margin[side.lower()], row, col + 1
+            )
+        custom_controls_layout.addLayout(margins_grid)
+        card.addWidget(self.border_custom_controls)
 
         _frame, card = self._card(controls_layout, "Border edges")
         sides_grid = QtWidgets.QGridLayout()
@@ -35331,6 +36613,14 @@ class PageDesignDialog(QtWidgets.QDialog):
             return
         self._design_changed("border")
 
+    def _border_distance_type_changed(self, *_args):
+        if self._updating:
+            return
+        # Update the mutually exclusive control groups immediately, then refresh the
+        # design preview using the effective equal/custom margins.
+        self._update_controls(refresh_canvas=False)
+        self._design_changed("border")
+
     def _number_position_input_changed(self, *_args):
         if self._updating:
             return
@@ -35382,6 +36672,8 @@ class PageDesignDialog(QtWidgets.QDialog):
             "color": self._border_color,
             "opacity": self.border_opacity.value(),
             "radius": self.border_radius.value() / 10.0,
+            "distance_type": str(self.border_distance_type.currentData() or "equal"),
+            "equal_distance": float(self.border_equal_distance.value()),
             "margins": {key: spin.value() for key, spin in self.border_margin.items()},
             "sides": {key: button.isChecked() for key, button in self.border_side_buttons.items()},
             "overlay": self.border_layer.currentData() == "foreground",
@@ -35462,8 +36754,14 @@ class PageDesignDialog(QtWidgets.QDialog):
             self._set_swatch(self.border_color_btn, self._border_color)
             self.border_opacity.setValue(int(round(float(border.get("opacity", 100)))))
             self.border_radius.setValue(int(round(float(border.get("radius", 0.0)) * 10.0)))
+            distance_type = str(border.get("distance_type") or "equal")
+            self._set_combo(self.border_distance_type, distance_type)
+            self.border_equal_distance.setValue(float(
+                border.get("equal_distance", _PAGE_DESIGN_BORDER_DEFAULT_MARGINS["left"])
+            ))
+            custom_margins = border.get("custom_margins") or border.get("margins") or {}
             for key, spin in self.border_margin.items():
-                spin.setValue(float((border.get("margins") or {}).get(key, _PAGE_DESIGN_BORDER_DEFAULT_MARGINS[key])))
+                spin.setValue(float(custom_margins.get(key, _PAGE_DESIGN_BORDER_DEFAULT_MARGINS[key])))
             for key, button in self.border_side_buttons.items():
                 button.setChecked(bool((border.get("sides") or {}).get(key, True)))
             self.border_layer.setCurrentIndex(1 if border.get("overlay", True) is False else 0)
@@ -35602,6 +36900,43 @@ class PageDesignDialog(QtWidgets.QDialog):
             container._page_design_disabled_opacity_effect = effect
         effect.setOpacity(1.0 if enabled else 0.42)
 
+    @staticmethod
+    def _set_border_distance_group_state(container, *, enabled, muted):
+        if container is None:
+            return
+
+        # Keep both groups visible at all times. Disable only the inactive inputs;
+        # disabled distance fields use the dialog stylesheet for their muted colors.
+        # Do not attach QGraphicsOpacityEffect to these child spin boxes: the parent
+        # Border panel already uses an opacity effect when the feature is off, and
+        # nesting effects here causes repeated QPainter::begin/translate warnings.
+        container.setVisible(True)
+        container.setEnabled(True)
+        container.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, False)
+
+        label_style = (
+            "QLabel { color: #777777; background: transparent; border: none; }"
+            if muted else
+            "QLabel { background: transparent; border: none; }"
+        )
+        for label in container.findChildren(QtWidgets.QLabel):
+            label.setVisible(True)
+            label.setStyleSheet(label_style)
+
+        for spin in container.findChildren(QtWidgets.QAbstractSpinBox):
+            spin.setVisible(True)
+            spin.setEnabled(bool(enabled))
+            # Only style a mode-inactive field here. When Border itself is off,
+            # its parent opacity effect already mutes the complete panel; applying
+            # these darker colors as well would make the fields too dim.
+            muted_value = bool(muted)
+            if spin.property("pageDesignDistanceMuted") != muted_value:
+                spin.setProperty("pageDesignDistanceMuted", muted_value)
+                style = spin.style()
+                style.unpolish(spin)
+                style.polish(spin)
+                spin.update()
+
     def _current_design_comparable_config(self):
         """Return the current editor state in the same normalized form used for common-state matching.
 
@@ -35650,6 +36985,19 @@ class PageDesignDialog(QtWidgets.QDialog):
             self.border_radius.setEnabled(border_active)
             self._set_tab_controls_enabled(self._numbering_controls, self.numbering_enable.isChecked())
             self._set_tab_controls_enabled(self._border_controls, border_active)
+            distance_type = str(self.border_distance_type.currentData() or "equal")
+            equal_active = distance_type == "equal"
+            custom_active = distance_type == "custom"
+            self._set_border_distance_group_state(
+                self.border_equal_controls,
+                enabled=border_active and equal_active,
+                muted=border_active and not equal_active,
+            )
+            self._set_border_distance_group_state(
+                self.border_custom_controls,
+                enabled=border_active and custom_active,
+                muted=border_active and not custom_active,
+            )
             self._set_tab_controls_enabled(self._watermark_controls, self.watermark_enable.isChecked())
 
             n = len(self.selected_entries)
@@ -36539,6 +37887,10 @@ class PageEditDialog(QtWidgets.QDialog):
         layout.addLayout(hint_row)
 
         self.grid = ThumbnailGrid()
+        # Share the already-existing thumbnail pixmap dictionary with the grid
+        # delegate. This is not a new cache: it lets painting scale the current
+        # page pixmap directly instead of relying on QIcon's native-size choice.
+        self.grid._thumbnail_pixmap_cache = self._thumb_cache
         self.grid.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._on_grid_context_menu)
         self.grid.itemSelectionChanged.connect(self._on_selection_changed)
@@ -41384,7 +42736,6 @@ class PageEditDialog(QtWidgets.QDialog):
                 f"Detection: {result.get('detection_model', cfg.get('detection_model', ''))}\n"
                 f"Recogn.  : {result.get('recognition_model', cfg.get('recognition_model', ''))}\n"
                 f"Version  : {result.get('ocr_version', cfg.get('ocr_version', ''))}\n"
-                f"Detector : {result.get('detection_size_percent', cfg.get('detection_size_percent', DEFAULT_OCR_DETECTION_SIZE_PERCENT))}% of rendered longest side\n"
                 f"Time taken : {result.get('time', 'unknown')}"
             )
             title = "OCR Completed with Warnings"
@@ -41397,7 +42748,6 @@ class PageEditDialog(QtWidgets.QDialog):
                 f"Detection: {result.get('detection_model', cfg.get('detection_model', ''))}\n"
                 f"Recogn. : {result.get('recognition_model', cfg.get('recognition_model', ''))}\n"
                 f"Version : {result.get('ocr_version', cfg.get('ocr_version', ''))}\n"
-                f"Detector : {result.get('detection_size_percent', cfg.get('detection_size_percent', DEFAULT_OCR_DETECTION_SIZE_PERCENT))}% of rendered longest side\n"
                 f"Time taken: {result.get('time', 'unknown')}"
             )
             title = "OCR Completed!"
@@ -42618,6 +43968,8 @@ class MainMenuPage(QtWidgets.QWidget):
         layout.addWidget(copyright_label)
 
     def set_mergerz_update_checking(self):
+        self.mergerz_update_label.setStyleSheet(
+            "background:transparent;border:none;color:#dedede;font-size:9.5pt;font-weight:600;")
         self.mergerz_update_label.setText("Checking for updates...")
         self.mergerz_update_label.setProperty("update_version", "")
         self.mergerz_update_button.hide()
@@ -42632,7 +43984,9 @@ class MainMenuPage(QtWidgets.QWidget):
         if not version:
             self.hide_mergerz_update_footer()
             return
-        self.mergerz_update_label.setText(f"New update found: v{version}.")
+        self.mergerz_update_label.setStyleSheet(
+            "background:transparent;border:none;color:#83d99c;font-size:9.5pt;font-weight:700;")
+        self.mergerz_update_label.setText(f"New update found: v{version}")
         self.mergerz_update_label.setProperty("update_version", version)
         self.mergerz_update_button.setEnabled(True)
         self.mergerz_update_button.show()
@@ -42644,6 +43998,8 @@ class MainMenuPage(QtWidgets.QWidget):
         self.mergerz_update_footer.repaint()
 
     def set_mergerz_update_installing(self):
+        self.mergerz_update_label.setStyleSheet(
+            "background:transparent;border:none;color:#dedede;font-size:9.5pt;font-weight:600;")
         self.mergerz_update_label.setText("Updating Mergerz...")
         self.mergerz_update_button.setEnabled(False)
         self.mergerz_update_button.show()
@@ -42691,13 +44047,17 @@ class MainMenuPage(QtWidgets.QWidget):
             self.gear_label.setPixmap(icon.pixmap(42, 42))
 
     def refresh_storage(self, animate=True):
+        # Used by the application-level return-to-menu detector to coalesce
+        # Hide/Close events from one modal dialog into a single refresh.
+        self._last_storage_refresh_at = time.monotonic()
+        if animate:
+            # Start the same refresh animation used at startup/manual refresh.
+            self._trigger_reload_spin()
         try:
             self.free_storage_label.setText(
                 f"Free storage: {check_free_storage()}")
         except Exception:
             pass
-        if animate:
-            self._trigger_reload_spin()
 
     def _trigger_reload_spin(self):
         self._reload_angle = 0
@@ -44556,15 +45916,47 @@ class LogsDialog(QtWidgets.QDialog):
         layout.addLayout(btn_row)
 
 
+def _populate_python_runtime_combo(combo, plugin_id, catalog=None, selected=None):
+    """Populate a runtime selector from UV's catalogue and select the requested choice."""
+    plugin_id = str(plugin_id or "")
+    catalog = catalog if isinstance(catalog, dict) else {}
+    selected = str(selected or _get_python_runtime_selection(plugin_id)).strip().lower()
+    combo.clear()
+    combo.addItem(f"Current · {platform.python_version()}", _PYTHON_RUNTIME_CURRENT)
+
+    versions = list(catalog.get(plugin_id) or _PYTHON_RUNTIME_FALLBACK_CATALOG.get(plugin_id) or [])
+    versions = [str(value).strip().lower() for value in versions]
+    versions = [value for value in versions if _valid_python_runtime_selection(plugin_id, value)
+                and value != _PYTHON_RUNTIME_CURRENT]
+    if selected != _PYTHON_RUNTIME_CURRENT and _valid_python_runtime_selection(plugin_id, selected):
+        if selected not in versions:
+            versions.append(selected)
+    versions = sorted(
+        set(versions),
+        key=lambda value: tuple(int(part) for part in value.split(".")),
+        reverse=True,
+    )
+    for version in versions:
+        combo.addItem(f"UV-managed · {version}", version)
+
+    index = combo.findData(selected)
+    if index < 0:
+        index = combo.findData(_PYTHON_RUNTIME_CURRENT)
+    combo.setCurrentIndex(max(0, index))
+    return combo
+
+
 class PluginUpdateConfirmationDialog(QtWidgets.QDialog):
-    """Confirmation dialog for a single plugin update after the online check succeeds."""
-    def __init__(self, plugin_name, updates, parent=None):
+    """Confirm one plugin update and choose the runtime for its rebuilt environment."""
+    def __init__(self, plugin_id, plugin_name, updates, python_runtime_catalog=None,
+                 selected_python=None, parent=None):
         super().__init__(parent)
+        self.plugin_id = str(plugin_id or "")
         self.setWindowTitle("Plugin Update Available")
         self.setModal(True)
         self.setMinimumWidth(620)
-        self.setMinimumHeight(360)
-        self.selected = True
+        self.setMinimumHeight(390 if self.plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID} else 360)
+        self.python_runtime_combo = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 22)
@@ -44589,23 +45981,56 @@ class PluginUpdateConfirmationDialog(QtWidgets.QDialog):
         card_layout.setContentsMargins(16, 14, 16, 14)
         card_layout.setSpacing(8)
 
-        current = ", ".join(
-            f"{item['library']} {item['current']}" for item in updates
-        )
-        latest = ", ".join(
-            f"{item['library']} {item['latest']}" for item in updates
-        )
+        current = ", ".join(f"{item['library']} {item['current']}" for item in updates)
+        latest = ", ".join(f"{item['library']} {item['latest']}" for item in updates)
         current_label = QtWidgets.QLabel(f"Current version: {current}")
         current_label.setWordWrap(True)
         current_label.setStyleSheet("color:#d0d0d0; font-size:10.5pt;")
         new_label = QtWidgets.QLabel(f"New version: {latest}")
         new_label.setWordWrap(True)
         new_label.setStyleSheet("color:#4ade80; font-size:10.5pt; font-weight:bold;")
-        prompt = QtWidgets.QLabel("Do you want to update now?")
+        prompt = QtWidgets.QLabel("Updating rebuilds the isolated plugin environment. Continue?")
+        prompt.setWordWrap(True)
         prompt.setStyleSheet("color:#aaa; font-size:10pt; margin-top:2px;")
         card_layout.addWidget(current_label)
         card_layout.addWidget(new_label)
         card_layout.addWidget(prompt)
+
+        if self.plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID}:
+            runtime_row = QtWidgets.QHBoxLayout()
+            runtime_row.setSpacing(10)
+            runtime_label = QtWidgets.QLabel("Python runtime:")
+            runtime_label.setStyleSheet("color:#d0d0d0; font-size:10pt;")
+            runtime_row.addWidget(runtime_label)
+            self.python_runtime_combo = QtWidgets.QComboBox()
+            self.python_runtime_combo.setMinimumWidth(190)
+            self.python_runtime_combo.setFixedHeight(32)
+            self.python_runtime_combo.setAccessibleName(f"{plugin_name} update Python runtime")
+            self.python_runtime_combo.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            self.python_runtime_combo.setStyleSheet("""
+                QComboBox {
+                    background:#242424; color:#e6e6e6; border:1px solid #3a3a3a;
+                    border-radius:7px; padding:5px 7px; font-size:9pt;
+                }
+                QComboBox:hover { border-color:#5a5a5a; }
+                QComboBox:focus { border-color:#0078d7; }
+                QComboBox::drop-down { border:none; width:20px; }
+                QComboBox QAbstractItemView {
+                    background:#242424; color:#e6e6e6; selection-background-color:#315b82;
+                    border:1px solid #3a3a3a; outline:none;
+                }
+            """)
+            selected_python = selected_python or _get_installed_python_runtime_selection(self.plugin_id)
+            _populate_python_runtime_combo(
+                self.python_runtime_combo, self.plugin_id,
+                python_runtime_catalog, selected_python,
+            )
+            self.python_runtime_combo.setToolTip(
+                "Choose the Python interpreter for the rebuilt environment. Both choices use UV for packages."
+            )
+            runtime_row.addWidget(self.python_runtime_combo, 1)
+            card_layout.addLayout(runtime_row)
+
         layout.addWidget(update_card, 1)
 
         buttons = QtWidgets.QHBoxLayout()
@@ -44642,15 +46067,21 @@ class PluginUpdateConfirmationDialog(QtWidgets.QDialog):
         buttons.addWidget(update)
         layout.addLayout(buttons)
 
+    def selected_python_runtime(self):
+        if self.python_runtime_combo is None:
+            return None
+        return self.python_runtime_combo.currentData()
+
 
 class PluginUpdateSelectionDialog(QtWidgets.QDialog):
-    """Scrollable multi-plugin update picker. Every detected update is selected by default."""
-    def __init__(self, plugin_entries, errors=None, parent=None):
+    """Choose plugin updates and Python runtimes for each selected Python plugin."""
+    def __init__(self, plugin_entries, errors=None, python_runtime_catalog=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Plugin Updates Available")
         self.setModal(True)
         self.setMinimumSize(700, 520)
         self._entries = []
+        self._python_runtime_catalog = python_runtime_catalog or {}
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -44714,12 +46145,8 @@ class PluginUpdateSelectionDialog(QtWidgets.QDialog):
             checkbox.stateChanged.connect(self._refresh_update_button)
             card_layout.addWidget(checkbox)
 
-            current = ", ".join(
-                f"{item['library']} {item['current']}" for item in entry["updates"]
-            )
-            latest = ", ".join(
-                f"{item['library']} {item['latest']}" for item in entry["updates"]
-            )
+            current = ", ".join(f"{item['library']} {item['current']}" for item in entry["updates"])
+            latest = ", ".join(f"{item['library']} {item['latest']}" for item in entry["updates"])
             current_label = QtWidgets.QLabel(f"Current version: {current}")
             current_label.setWordWrap(True)
             current_label.setStyleSheet("color:#d0d0d0; font-size:10pt; padding-left:28px;")
@@ -44731,9 +46158,48 @@ class PluginUpdateSelectionDialog(QtWidgets.QDialog):
             card_layout.addWidget(current_label)
             card_layout.addWidget(new_label)
 
+            plugin_id = str(entry.get("plugin_id") or "")
+            runtime_combo = None
+            if plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID}:
+                runtime_row = QtWidgets.QHBoxLayout()
+                runtime_row.setContentsMargins(28, 2, 0, 0)
+                runtime_row.setSpacing(10)
+                runtime_label = QtWidgets.QLabel("Python runtime for rebuilt environment:")
+                runtime_label.setWordWrap(True)
+                runtime_label.setStyleSheet("color:#aaa; font-size:9.5pt;")
+                runtime_row.addWidget(runtime_label, 1)
+                runtime_combo = QtWidgets.QComboBox()
+                runtime_combo.setMinimumWidth(190)
+                runtime_combo.setFixedHeight(32)
+                runtime_combo.setAccessibleName(f"{entry['plugin']} update Python runtime")
+                runtime_combo.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+                runtime_combo.setStyleSheet("""
+                    QComboBox {
+                        background:#242424; color:#e6e6e6; border:1px solid #3a3a3a;
+                        border-radius:7px; padding:5px 7px; font-size:9pt;
+                    }
+                    QComboBox:hover { border-color:#5a5a5a; }
+                    QComboBox:focus { border-color:#0078d7; }
+                    QComboBox::drop-down { border:none; width:20px; }
+                    QComboBox QAbstractItemView {
+                        background:#242424; color:#e6e6e6; selection-background-color:#315b82;
+                        border:1px solid #3a3a3a; outline:none;
+                    }
+                """)
+                selected_runtime = _get_installed_python_runtime_selection(plugin_id)
+                _populate_python_runtime_combo(
+                    runtime_combo, plugin_id, self._python_runtime_catalog, selected_runtime,
+                )
+                runtime_combo.setToolTip(
+                    "Choose which Python interpreter to use when this plugin's isolated environment is rebuilt."
+                )
+                runtime_row.addWidget(runtime_combo)
+                card_layout.addLayout(runtime_row)
+
             self._entries.append({
                 "entry": entry,
                 "checkbox": checkbox,
+                "runtime_combo": runtime_combo,
             })
             container_layout.addWidget(card)
 
@@ -44782,18 +46248,705 @@ class PluginUpdateSelectionDialog(QtWidgets.QDialog):
         self.update_button.setEnabled(count > 0)
 
     def selected_entries(self):
-        return [
-            item["entry"]
-            for item in self._entries
-            if item["checkbox"].isChecked()
-        ]
+        selected = []
+        for item in self._entries:
+            if not item["checkbox"].isChecked():
+                continue
+            entry = dict(item["entry"])
+            result = dict(entry.get("check_result") or {})
+            combo = item.get("runtime_combo")
+            if combo is not None:
+                result["python_selection"] = combo.currentData()
+            entry["check_result"] = result
+            selected.append(entry)
+        return selected
 
 
 # ============================================================
 # SETTINGS PAGE
 # ============================================================
+def _decode_changelog_json(payload):
+    """Decode release notes, tolerating a missing comma between adjacent top-level entries."""
+    text = payload.decode("utf-8-sig") if isinstance(payload, (bytes, bytearray)) else str(payload)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_error:
+        # Recover only the common typo seen in changelog files: `} {` between two
+        # objects directly inside the root array. Do not alter nested objects or strings.
+        repaired = []
+        stack = []
+        in_string = False
+        escaped = False
+        for index, char in enumerate(text):
+            if in_string:
+                repaired.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                repaired.append(char)
+                continue
+
+            closes_root_entry = (
+                char == "}" and len(stack) == 2
+                and stack[0] == "[" and stack[-1] == "{"
+            )
+            repaired.append(char)
+            if char in "[{":
+                stack.append(char)
+            elif char in "]}":
+                if stack:
+                    stack.pop()
+                if closes_root_entry:
+                    lookahead = index + 1
+                    while lookahead < len(text) and text[lookahead].isspace():
+                        lookahead += 1
+                    if lookahead < len(text) and text[lookahead] == "{":
+                        repaired.append(",")
+
+        repaired_text = "".join(repaired)
+        if repaired_text == text:
+            raise original_error
+        try:
+            return json.loads(repaired_text)
+        except json.JSONDecodeError:
+            raise original_error
+
+
+def _decode_faq_markdown(payload):
+    """Parse the simple, numbered FAQ Markdown format used by online/faq.md."""
+    content = payload.decode("utf-8-sig") if isinstance(payload, (bytes, bytearray)) else str(payload)
+    sections = re.split(r"(?m)^##[ \t]+(FAQ-\d+)[ \t]*$", content)
+    entries = []
+    for index in range(1, len(sections), 2):
+        faq_id = sections[index].strip()
+        section = sections[index + 1]
+        question_match = re.search(
+            r"(?m)^\*\*Question:\*\*[ \t]*(.+?)[ \t]*$", section)
+        answer_match = re.search(
+            r"(?ms)^\*\*Answer:\*\*[ \t]*(?:\r?\n)?(.*?)(?=^[ \t]*---[ \t]*$|\Z)",
+            section)
+        if not question_match or not answer_match:
+            continue
+        question = question_match.group(1).strip()
+        answer = "\n".join(line.rstrip() for line in answer_match.group(1).strip().splitlines()).strip()
+        if question and answer:
+            entries.append({"id": faq_id, "question": question, "answer": answer})
+    return entries
+
+
+class _AboutResourceFetchTask:
+    """Fetch online About resources from jsDelivr, falling back to Statically."""
+
+    _URLS = {
+        "changelog": (
+            "https://cdn.jsdelivr.net/gh/AfnanTawsif/mergerz@main/online/changelog.json",
+            "https://cdn.statically.io/gh/AfnanTawsif/mergerz/main/online/changelog.json",
+        ),
+        "faq": (
+            "https://cdn.jsdelivr.net/gh/AfnanTawsif/mergerz@main/online/faq.md",
+            "https://cdn.statically.io/gh/AfnanTawsif/mergerz/main/online/faq.md",
+        ),
+    }
+
+    def __init__(self, resource_type):
+        self.resource_type = str(resource_type or "").strip().lower()
+        if self.resource_type not in self._URLS:
+            raise ValueError(f"Unsupported About resource: {self.resource_type}")
+
+    def cancel(self):
+        # urllib's socket timeout bounds each attempt; callers can safely close the UI.
+        pass
+
+    def run(self, worker):
+        errors = []
+        for index, url in enumerate(self._URLS[self.resource_type]):
+            timeout = 8 if index == 0 else 5
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": f"Mergerz/{__version__}",
+                        "Accept": (
+                            "application/json" if self.resource_type == "changelog"
+                            else "text/markdown, text/plain;q=0.9, */*;q=0.8"
+                        ),
+                        "Cache-Control": "no-cache",
+                    },
+                )
+                max_bytes = 4 * 1024 * 1024
+                deadline = time.monotonic() + timeout
+                chunks = []
+                received = 0
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(f"Request timed out after {timeout} seconds.")
+                        # urllib's socket timeout is normally an inactivity timeout. Reset
+                        # it to the remaining budget on each read to enforce a total attempt
+                        # deadline as well, including slow-drip responses.
+                        try:
+                            response.fp.raw._sock.settimeout(remaining)
+                        except Exception:
+                            pass
+                        chunk = response.read(min(64 * 1024, max_bytes + 1 - received))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        received += len(chunk)
+                        if received > max_bytes:
+                            raise ValueError(
+                                f"The response exceeded the {max_bytes // (1024 * 1024)} MB size limit.")
+                payload = b"".join(chunks)
+                if not payload:
+                    raise ValueError("The CDN returned an empty response.")
+                if len(payload) > max_bytes:
+                    raise ValueError(f"The response exceeded the {max_bytes // (1024 * 1024)} MB size limit.")
+
+                if self.resource_type == "faq":
+                    result_data = _decode_faq_markdown(payload)
+                    if not result_data:
+                        raise ValueError("The FAQ contains no valid question-and-answer entries.")
+                else:
+                    decoded = _decode_changelog_json(payload)
+                    if not isinstance(decoded, list):
+                        raise ValueError("The changelog data must be a JSON list.")
+                    entries = []
+                    for item in decoded:
+                        if not isinstance(item, dict):
+                            continue
+                        version = str(item.get("version") or "").strip()
+                        logs = item.get("logs")
+                        if not version or not isinstance(logs, list):
+                            continue
+                        clean_logs = [str(line).strip() for line in logs if str(line).strip()]
+                        entries.append({"version": version, "logs": clean_logs})
+                    if not entries:
+                        raise ValueError("The changelog contains no valid version entries.")
+                    result_data = entries
+
+                return {
+                    "ok": True,
+                    "resource_type": self.resource_type,
+                    "data": result_data,
+                    "source": url,
+                    "used_fallback": index > 0,
+                }
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        reason = " | ".join(errors[-2:]) or "No response was received."
+        resource_label = "FAQ" if self.resource_type == "faq" else "changelog"
+        raise RuntimeError(f"Could not load {resource_label} from either CDN. {reason}")
+
+
+class ChangelogDialog(QtWidgets.QDialog):
+    """Scrollable, asynchronously loaded release notes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mergerz Changelog")
+        self.setModal(True)
+        self.setMinimumSize(520, 460)
+        self.resize(680, 700)
+        self._fetch_thread = None
+        self._loaded_entries = None
+        self.setStyleSheet("""
+            QDialog { background:#191919; color:#f0f0f0; }
+            QLabel { background:transparent; }
+            QPushButton {
+                background:#2b2b2b; color:#eeeeee; border:1px solid #414141;
+                border-radius:7px; padding:7px 15px; font-weight:600;
+            }
+            QPushButton:hover { background:#363636; border-color:#555555; }
+            QPushButton:disabled { color:#666666; background:#222222; border-color:#303030; }
+        """)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(20, 18, 20, 18)
+        outer.setSpacing(14)
+
+        title_row = QtWidgets.QHBoxLayout()
+        title_icon = QtWidgets.QLabel()
+        title_icon.setFixedSize(32, 32)
+        icon = _render_svg_icon(os.path.join(ICONS_FOLDER, "logo.svg"), size=28)
+        if icon is not None:
+            title_icon.setPixmap(icon.pixmap(28, 28))
+        title_row.addWidget(title_icon, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        title_col = QtWidgets.QVBoxLayout()
+        title_col.setSpacing(1)
+        title = QtWidgets.QLabel("Mergerz Changelog")
+        title.setStyleSheet("font-size:17pt;font-weight:700;color:#ffffff;")
+        subtitle = QtWidgets.QLabel("Release notes, newest first")
+        subtitle.setStyleSheet("font-size:9.5pt;color:#8d8d8d;")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        title_row.addLayout(title_col, 1)
+        outer.addLayout(title_row)
+
+        self.state_stack = QtWidgets.QStackedWidget()
+        outer.addWidget(self.state_stack, 1)
+
+        self.loading_page = QtWidgets.QWidget()
+        loading_layout = QtWidgets.QVBoxLayout(self.loading_page)
+        loading_layout.setContentsMargins(10, 24, 10, 24)
+        loading_layout.setSpacing(15)
+        loading_layout.addStretch(1)
+        self.loading_label = QtWidgets.QLabel("Loading changelog...")
+        self.loading_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.loading_label.setStyleSheet("font-size:11pt;color:#d3d3d3;")
+        loading_layout.addWidget(self.loading_label)
+        self.loading_bar = QtWidgets.QProgressBar()
+        self.loading_bar.setRange(0, 0)
+        self.loading_bar.setTextVisible(False)
+        self.loading_bar.setFixedSize(210, 6)
+        self.loading_bar.setStyleSheet("""
+            QProgressBar { border:none; border-radius:3px; background:#303030; }
+            QProgressBar::chunk { border-radius:3px; background:#5c9de2; }
+        """)
+        loading_row = QtWidgets.QHBoxLayout()
+        loading_row.addStretch(1)
+        loading_row.addWidget(self.loading_bar)
+        loading_row.addStretch(1)
+        loading_layout.addLayout(loading_row)
+        loading_layout.addStretch(1)
+        self.state_stack.addWidget(self.loading_page)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.scroll.setStyleSheet("""
+            QScrollArea { border:none;background:transparent; }
+            QScrollBar:vertical { width:10px;background:#1f1f1f;margin:2px 1px 2px 0; }
+            QScrollBar::handle:vertical { background:#454545;border-radius:5px;min-height:28px; }
+            QScrollBar::handle:vertical:hover { background:#5a5a5a; }
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical { background:transparent;border:none; }
+        """)
+        self.changelog_content = QtWidgets.QWidget()
+        self.changelog_layout = QtWidgets.QVBoxLayout(self.changelog_content)
+        self.changelog_layout.setContentsMargins(2, 2, 7, 8)
+        self.changelog_layout.setSpacing(12)
+        self.scroll.setWidget(self.changelog_content)
+        self.state_stack.addWidget(self.scroll)
+
+        self.error_page = QtWidgets.QWidget()
+        error_layout = QtWidgets.QVBoxLayout(self.error_page)
+        error_layout.setContentsMargins(16, 24, 16, 24)
+        error_layout.setSpacing(12)
+        error_layout.addStretch(1)
+        error_icon = QtWidgets.QLabel("!")
+        error_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        error_icon.setFixedSize(44, 44)
+        error_icon.setStyleSheet("background:#342626;color:#e68b8b;border-radius:22px;font-size:22pt;font-weight:700;")
+        error_icon_row = QtWidgets.QHBoxLayout()
+        error_icon_row.addStretch(1)
+        error_icon_row.addWidget(error_icon)
+        error_icon_row.addStretch(1)
+        error_layout.addLayout(error_icon_row)
+        self.error_title = QtWidgets.QLabel("Couldn't load changelog")
+        self.error_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.error_title.setStyleSheet("font-size:12pt;font-weight:700;color:#f0f0f0;")
+        error_layout.addWidget(self.error_title)
+        self.error_detail = QtWidgets.QLabel(
+            "Check your internet connection and try again.")
+        self.error_detail.setWordWrap(True)
+        self.error_detail.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.error_detail.setStyleSheet("color:#999999;font-size:9.5pt;")
+        error_layout.addWidget(self.error_detail)
+        self.retry_button = QtWidgets.QPushButton("Try again")
+        self.retry_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.retry_button.clicked.connect(self.load_changelog)
+        retry_row = QtWidgets.QHBoxLayout()
+        retry_row.addStretch(1)
+        retry_row.addWidget(self.retry_button)
+        retry_row.addStretch(1)
+        error_layout.addLayout(retry_row)
+        error_layout.addStretch(1)
+        self.state_stack.addWidget(self.error_page)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        close = QtWidgets.QPushButton("Close")
+        close.setFixedWidth(100)
+        close.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        outer.addLayout(buttons)
+
+        self.state_stack.setCurrentWidget(self.loading_page)
+        # Let the modal dialog paint its loading state before the network worker starts.
+        QtCore.QTimer.singleShot(80, self.load_changelog)
+
+    def load_changelog(self):
+        thread = self._fetch_thread
+        if thread is not None and thread.isRunning():
+            return
+        self.loading_label.setText("Loading changelog...")
+        self.state_stack.setCurrentWidget(self.loading_page)
+        self.retry_button.setEnabled(False)
+        thread = PluginTaskThread(_AboutResourceFetchTask("changelog"), None)
+        self._fetch_thread = thread
+
+        def on_result(result):
+            if not self.isVisible():
+                return
+            try:
+                self._populate_changelog(result.get("data") or [])
+                self.state_stack.setCurrentWidget(self.scroll)
+            except Exception as exc:
+                self.error_detail.setText(f"The changelog could not be displayed: {exc}")
+                self.state_stack.setCurrentWidget(self.error_page)
+
+        def on_error(message):
+            if not self.isVisible():
+                return
+            self.error_detail.setText(
+                "Both CDN attempts failed or timed out. Check your internet connection and try again.\n\n"
+                + str(message))
+            self.state_stack.setCurrentWidget(self.error_page)
+
+        def on_finished():
+            self.retry_button.setEnabled(True)
+            if self._fetch_thread is thread:
+                self._fetch_thread = None
+
+        thread.result_signal.connect(on_result)
+        thread.error_signal.connect(on_error)
+        thread.finished.connect(on_finished)
+        thread.start()
+
+    def _populate_changelog(self, entries):
+        while self.changelog_layout.count():
+            item = self.changelog_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not entries:
+            empty = QtWidgets.QLabel("No changelog entries are available.")
+            empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet("color:#a0a0a0;padding:28px;")
+            self.changelog_layout.addWidget(empty)
+            self.changelog_layout.addStretch(1)
+            return
+
+        current_version = re.sub(r"^[vV]", "", str(__version__).strip()).casefold()
+
+        for entry_index, entry in enumerate(entries):
+            version = str(entry.get("version") or "Unknown version").strip()
+            normalized_version = re.sub(r"^[vV]", "", version).casefold()
+            is_latest = entry_index == 0
+            is_yours = bool(current_version) and normalized_version == current_version
+            logs = entry.get("logs") or []
+            card = QtWidgets.QFrame()
+            card.setObjectName("changelogVersionCard")
+            card.setStyleSheet("""
+                QFrame#changelogVersionCard {
+                    background:#202020;border:1px solid #353535;border-radius:9px;
+                }
+                QLabel { background:transparent;border:none; }
+            """)
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 12, 14, 13)
+            card_layout.setSpacing(9)
+            header = QtWidgets.QHBoxLayout()
+            version_label = QtWidgets.QLabel(version)
+            version_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            version_label.setStyleSheet(
+                "background:#2a3c4d;color:#9dccff;border:1px solid #3b5268;"
+                "border-radius:5px;padding:4px 9px;font-size:10pt;font-weight:700;")
+            header.addWidget(version_label, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+
+            # Keep the badges compact and visually distinct from each other.
+            if is_latest:
+                latest_badge = QtWidgets.QLabel("Latest")
+                latest_badge.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+                latest_badge.setStyleSheet(
+                    "background:#244536;color:#9be3ba;border:1px solid #35694f;"
+                    "border-radius:5px;padding:4px 8px;font-size:9pt;font-weight:700;"
+                )
+                header.addWidget(latest_badge, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+
+            if is_yours:
+                yours_badge = QtWidgets.QLabel("Yours")
+                yours_badge.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+                yours_badge.setStyleSheet(
+                    "background:#49345f;color:#dfc0ff;border:1px solid #6b4b8b;"
+                    "border-radius:5px;padding:4px 8px;font-size:9pt;font-weight:700;"
+                )
+                header.addWidget(yours_badge, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+
+            header.addStretch(1)
+            card_layout.addLayout(header)
+            separator = QtWidgets.QFrame()
+            separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            separator.setStyleSheet("color:#343434;background:#343434;max-height:1px;border:none;")
+            card_layout.addWidget(separator)
+            if logs:
+                for line in logs:
+                    bullet = QtWidgets.QLabel("•  " + str(line))
+                    bullet.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+                    bullet.setWordWrap(True)
+                    bullet.setStyleSheet("color:#d0d0d0;font-size:9.5pt;padding:1px 0;")
+                    card_layout.addWidget(bullet)
+            else:
+                empty_logs = QtWidgets.QLabel("No details listed for this version.")
+                empty_logs.setStyleSheet("color:#858585;font-size:9.5pt;font-style:italic;")
+                card_layout.addWidget(empty_logs)
+            self.changelog_layout.addWidget(card)
+        self.changelog_layout.addStretch(1)
+
+
+class FAQDialog(QtWidgets.QDialog):
+    """Scrollable FAQ cards loaded online with the same fallback flow as the changelog."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mergerz FAQ")
+        self.setModal(True)
+        self.setMinimumSize(520, 460)
+        self.resize(680, 700)
+        self._fetch_thread = None
+        self.setStyleSheet("""
+            QDialog { background:#191919; color:#f0f0f0; }
+            QLabel { background:transparent; }
+            QPushButton {
+                background:#2b2b2b; color:#eeeeee; border:1px solid #414141;
+                border-radius:7px; padding:7px 15px; font-weight:600;
+            }
+            QPushButton:hover { background:#363636; border-color:#555555; }
+            QPushButton:disabled { color:#666666; background:#222222; border-color:#303030; }
+        """)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(20, 18, 20, 18)
+        outer.setSpacing(14)
+
+        title_row = QtWidgets.QHBoxLayout()
+        title_icon = QtWidgets.QLabel()
+        title_icon.setFixedSize(32, 32)
+        icon = _render_svg_icon(os.path.join(ICONS_FOLDER, "logo.svg"), size=28)
+        if icon is not None:
+            title_icon.setPixmap(icon.pixmap(28, 28))
+        title_row.addWidget(title_icon, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        title_col = QtWidgets.QVBoxLayout()
+        title_col.setSpacing(1)
+        title = QtWidgets.QLabel("Mergerz FAQ")
+        title.setStyleSheet("font-size:17pt;font-weight:700;color:#ffffff;")
+        subtitle = QtWidgets.QLabel("Answers to common questions")
+        subtitle.setStyleSheet("font-size:9.5pt;color:#8d8d8d;")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        title_row.addLayout(title_col, 1)
+        outer.addLayout(title_row)
+
+        self.state_stack = QtWidgets.QStackedWidget()
+        outer.addWidget(self.state_stack, 1)
+
+        self.loading_page = QtWidgets.QWidget()
+        loading_layout = QtWidgets.QVBoxLayout(self.loading_page)
+        loading_layout.setContentsMargins(10, 24, 10, 24)
+        loading_layout.setSpacing(15)
+        loading_layout.addStretch(1)
+        self.loading_label = QtWidgets.QLabel("Loading FAQ...")
+        self.loading_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.loading_label.setStyleSheet("font-size:11pt;color:#d3d3d3;")
+        loading_layout.addWidget(self.loading_label)
+        self.loading_bar = QtWidgets.QProgressBar()
+        self.loading_bar.setRange(0, 0)
+        self.loading_bar.setTextVisible(False)
+        self.loading_bar.setFixedSize(210, 6)
+        self.loading_bar.setStyleSheet("""
+            QProgressBar { border:none; border-radius:3px; background:#303030; }
+            QProgressBar::chunk { border-radius:3px; background:#5c9de2; }
+        """)
+        loading_row = QtWidgets.QHBoxLayout()
+        loading_row.addStretch(1)
+        loading_row.addWidget(self.loading_bar)
+        loading_row.addStretch(1)
+        loading_layout.addLayout(loading_row)
+        loading_layout.addStretch(1)
+        self.state_stack.addWidget(self.loading_page)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.scroll.setStyleSheet("""
+            QScrollArea { border:none;background:transparent; }
+            QScrollBar:vertical { width:10px;background:#1f1f1f;margin:2px 1px 2px 0; }
+            QScrollBar::handle:vertical { background:#454545;border-radius:5px;min-height:28px; }
+            QScrollBar::handle:vertical:hover { background:#5a5a5a; }
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical { background:transparent;border:none; }
+        """)
+        self.faq_content = QtWidgets.QWidget()
+        self.faq_layout = QtWidgets.QVBoxLayout(self.faq_content)
+        self.faq_layout.setContentsMargins(2, 2, 7, 8)
+        self.faq_layout.setSpacing(12)
+        self.scroll.setWidget(self.faq_content)
+        self.state_stack.addWidget(self.scroll)
+
+        self.error_page = QtWidgets.QWidget()
+        error_layout = QtWidgets.QVBoxLayout(self.error_page)
+        error_layout.setContentsMargins(16, 24, 16, 24)
+        error_layout.setSpacing(12)
+        error_layout.addStretch(1)
+        error_icon = QtWidgets.QLabel("!")
+        error_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        error_icon.setFixedSize(44, 44)
+        error_icon.setStyleSheet(
+            "background:#342626;color:#e68b8b;border-radius:22px;font-size:22pt;font-weight:700;")
+        error_icon_row = QtWidgets.QHBoxLayout()
+        error_icon_row.addStretch(1)
+        error_icon_row.addWidget(error_icon)
+        error_icon_row.addStretch(1)
+        error_layout.addLayout(error_icon_row)
+        self.error_title = QtWidgets.QLabel("Couldn't load FAQ")
+        self.error_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.error_title.setStyleSheet("font-size:12pt;font-weight:700;color:#f0f0f0;")
+        error_layout.addWidget(self.error_title)
+        self.error_detail = QtWidgets.QLabel(
+            "Check your internet connection and try again.")
+        self.error_detail.setWordWrap(True)
+        self.error_detail.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.error_detail.setStyleSheet("color:#999999;font-size:9.5pt;")
+        error_layout.addWidget(self.error_detail)
+        self.retry_button = QtWidgets.QPushButton("Try again")
+        self.retry_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.retry_button.clicked.connect(self.load_faq)
+        retry_row = QtWidgets.QHBoxLayout()
+        retry_row.addStretch(1)
+        retry_row.addWidget(self.retry_button)
+        retry_row.addStretch(1)
+        error_layout.addLayout(retry_row)
+        error_layout.addStretch(1)
+        self.state_stack.addWidget(self.error_page)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        close = QtWidgets.QPushButton("Close")
+        close.setFixedWidth(100)
+        close.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        outer.addLayout(buttons)
+
+        self.state_stack.setCurrentWidget(self.loading_page)
+        # Let the modal dialog paint its loading state before starting the network worker.
+        QtCore.QTimer.singleShot(80, self.load_faq)
+
+    def load_faq(self):
+        thread = self._fetch_thread
+        if thread is not None and thread.isRunning():
+            return
+        self.loading_label.setText("Loading FAQ...")
+        self.state_stack.setCurrentWidget(self.loading_page)
+        self.retry_button.setEnabled(False)
+        thread = PluginTaskThread(_AboutResourceFetchTask("faq"), None)
+        self._fetch_thread = thread
+
+        def on_result(result):
+            if not self.isVisible():
+                return
+            try:
+                self._populate_faq(result.get("data") or [])
+                self.state_stack.setCurrentWidget(self.scroll)
+            except Exception as exc:
+                self.error_detail.setText(f"The FAQ could not be displayed: {exc}")
+                self.state_stack.setCurrentWidget(self.error_page)
+
+        def on_error(message):
+            if not self.isVisible():
+                return
+            self.error_detail.setText(
+                "Both CDN attempts failed or timed out. Check your internet connection and try again.\n\n"
+                + str(message))
+            self.state_stack.setCurrentWidget(self.error_page)
+
+        def on_finished():
+            self.retry_button.setEnabled(True)
+            if self._fetch_thread is thread:
+                self._fetch_thread = None
+
+        thread.result_signal.connect(on_result)
+        thread.error_signal.connect(on_error)
+        thread.finished.connect(on_finished)
+        thread.start()
+
+    def _populate_faq(self, entries):
+        while self.faq_layout.count():
+            item = self.faq_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not entries:
+            empty = QtWidgets.QLabel("No FAQ entries are available.")
+            empty.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet("color:#a0a0a0;padding:28px;")
+            self.faq_layout.addWidget(empty)
+            self.faq_layout.addStretch(1)
+            return
+
+        for entry in entries:
+            faq_id = str(entry.get("id") or "FAQ").strip()
+            question = str(entry.get("question") or "").strip()
+            answer = str(entry.get("answer") or "").strip()
+            card = QtWidgets.QFrame()
+            card.setObjectName("faqCard")
+            card.setStyleSheet("""
+                QFrame#faqCard {
+                    background:#202020;border:1px solid #353535;border-radius:9px;
+                }
+                QLabel { background:transparent;border:none; }
+            """)
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 13, 14, 14)
+            card_layout.setSpacing(9)
+            header = QtWidgets.QHBoxLayout()
+            header.setSpacing(10)
+            id_label = QtWidgets.QLabel(faq_id)
+            id_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            id_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            id_label.setStyleSheet(
+                "background:#2a3c4d;color:#9dccff;border:1px solid #3b5268;"
+                "border-radius:5px;padding:4px 8px;font-size:9pt;font-weight:700;")
+            header.addWidget(id_label, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+            question_label = QtWidgets.QLabel(question)
+            question_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            question_label.setWordWrap(True)
+            question_label.setStyleSheet("color:#ffffff;font-size:10.5pt;font-weight:700;padding-top:2px;")
+            header.addWidget(question_label, 1)
+            card_layout.addLayout(header)
+
+            separator = QtWidgets.QFrame()
+            separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            separator.setStyleSheet("color:#343434;background:#343434;max-height:1px;border:none;")
+            card_layout.addWidget(separator)
+
+            answer_title = QtWidgets.QLabel("ANSWER")
+            answer_title.setStyleSheet("color:#8fbff0;font-size:8.5pt;font-weight:700;letter-spacing:1px;")
+            card_layout.addWidget(answer_title)
+            answer_label = QtWidgets.QLabel(answer)
+            answer_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            answer_label.setWordWrap(True)
+            answer_label.setStyleSheet("color:#d0d0d0;font-size:9.5pt;line-height:1.4;padding:0;")
+            card_layout.addWidget(answer_label)
+            self.faq_layout.addWidget(card)
+        self.faq_layout.addStretch(1)
+
+
 class AppSettingsPage(QtWidgets.QWidget):
     back_signal = QtCore.Signal()
+    mergerz_update_check_requested = QtCore.Signal()
+    mergerz_update_requested = QtCore.Signal(str)
 
     _BLUE_STYLE = """
         QPushButton {
@@ -44813,6 +46966,24 @@ class AppSettingsPage(QtWidgets.QWidget):
         }
         QPushButton:hover { background-color: #353535; }
         QPushButton:pressed { background-color: #222; }
+    """
+    _ABOUT_DARK_BUTTON_STYLE = """
+        QPushButton {
+            background-color:#2a2a2a; color:#f0f0f0; border:1px solid #3a3a3a;
+            border-radius:6px; padding:4px 10px; font-weight:700; font-size:9.5pt;
+        }
+        QPushButton:hover { background-color:#353535; }
+        QPushButton:pressed { background-color:#222; }
+        QPushButton:disabled { background-color:#222; color:#777; border-color:#303030; }
+    """
+    _ABOUT_BLUE_BUTTON_STYLE = """
+        QPushButton {
+            background-color:#0078d7; color:white; border:none; border-radius:6px;
+            padding:4px 10px; font-weight:700; font-size:9.5pt;
+        }
+        QPushButton:hover { background-color:#005fa3; }
+        QPushButton:pressed { background-color:#004f89; }
+        QPushButton:disabled { background-color:#2a2a2a; color:#666; }
     """
     _CONTROL_STYLE = """
         QSpinBox, QDoubleSpinBox, QComboBox {
@@ -44865,7 +47036,7 @@ class AppSettingsPage(QtWidgets.QWidget):
         super().__init__(parent)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(28, 22, 28, 20)
-        outer.setSpacing(12)
+        outer.setSpacing(18)
 
         title_row = QtWidgets.QHBoxLayout()
         title_row.setSpacing(9)
@@ -45160,6 +47331,140 @@ class AppSettingsPage(QtWidgets.QWidget):
         self.tabs.addTab(adv_scroll, "General")
         # Keep General first so the default Settings view opens there.
         self.tabs.tabBar().moveTab(1, 0)
+
+        # ---------------- About ----------------
+        # Keep this after Multiprocessing in the visible tab order. General is moved
+        # to index zero above, so this tab is appended here as the final Settings tab.
+        self.about_scroll = make_scroll_tab()
+        self.about_tab = QtWidgets.QWidget()
+        about_layout = QtWidgets.QVBoxLayout(self.about_tab)
+        about_layout.setContentsMargins(16, 16, 16, 14)
+        about_layout.setSpacing(13)
+        about_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
+        self.about_scroll.setWidget(self.about_tab)
+
+        about_app_group = QtWidgets.QGroupBox("App")
+        about_app_group.setStyleSheet(section_style)
+        about_app_layout = QtWidgets.QVBoxLayout(about_app_group)
+        about_app_layout.setContentsMargins(12, 10, 12, 12)
+        about_app_layout.setSpacing(9)
+
+        version_row = QtWidgets.QHBoxLayout()
+        version_row.setSpacing(10)
+        version_title = QtWidgets.QLabel("Mergerz version")
+        version_title.setStyleSheet("font-size:10pt;color:#e0e0e0;")
+        self.about_current_version_label = QtWidgets.QLabel(
+            f"v{_installed_mergerz_version()}")
+        self.about_current_version_label.setStyleSheet(
+            "color:#b7d8ff;font-size:10pt;font-weight:700;")
+        version_row.addWidget(version_title)
+        version_row.addWidget(self.about_current_version_label)
+        version_row.addStretch(1)
+        self.about_check_update_btn = QtWidgets.QPushButton("Check updates")
+        self.about_check_update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.about_check_update_btn.setFixedSize(138, 30)
+        self.about_check_update_btn.setStyleSheet(self._ABOUT_DARK_BUTTON_STYLE)
+        self._about_update_version = ""
+        self._about_current_version = _installed_mergerz_version()
+        self._about_update_button_mode = "check"
+        self.about_check_update_btn.clicked.connect(self._on_about_update_button_clicked)
+        version_row.addWidget(self.about_check_update_btn)
+        about_app_layout.addLayout(version_row)
+
+        changelog_row = QtWidgets.QHBoxLayout()
+        changelog_row.setSpacing(10)
+        changelog_label = QtWidgets.QLabel("Mergerz changelog")
+        changelog_label.setStyleSheet("font-size:10pt;color:#e0e0e0;")
+        changelog_row.addWidget(changelog_label)
+        changelog_row.addStretch(1)
+        self.about_changelog_btn = QtWidgets.QPushButton("Read changelog")
+        self.about_changelog_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.about_changelog_btn.setFixedSize(138, 30)
+        self.about_changelog_btn.setStyleSheet(self._ABOUT_DARK_BUTTON_STYLE)
+        self.about_changelog_btn.clicked.connect(self._open_changelog_dialog)
+        changelog_row.addWidget(self.about_changelog_btn)
+        about_app_layout.addLayout(changelog_row)
+
+        faq_row = QtWidgets.QHBoxLayout()
+        faq_row.setSpacing(10)
+        faq_label = QtWidgets.QLabel("Frequently asked questions")
+        faq_label.setStyleSheet("font-size:10pt;color:#e0e0e0;")
+        faq_row.addWidget(faq_label)
+        faq_row.addStretch(1)
+        self.about_faq_btn = QtWidgets.QPushButton("Read FAQ")
+        self.about_faq_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.about_faq_btn.setFixedSize(138, 30)
+        self.about_faq_btn.setStyleSheet(self._ABOUT_DARK_BUTTON_STYLE)
+        self.about_faq_btn.clicked.connect(self._open_faq_dialog)
+        faq_row.addWidget(self.about_faq_btn)
+        about_app_layout.addLayout(faq_row)
+
+        repository_row = QtWidgets.QHBoxLayout()
+        repository_row.setSpacing(10)
+        repository_label = QtWidgets.QLabel("Project repository")
+        repository_label.setStyleSheet("font-size:10pt;color:#e0e0e0;")
+        repository_row.addWidget(repository_label)
+        repository_row.addStretch(1)
+        self.about_repository_btn = QtWidgets.QPushButton("Open GitHub")
+        self.about_repository_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.about_repository_btn.setFixedSize(138, 30)
+        self.about_repository_btn.setStyleSheet(self._ABOUT_DARK_BUTTON_STYLE)
+        self.about_repository_btn.clicked.connect(
+            lambda _, url="https://github.com/AfnanTawsif/mergerz":
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl(url)))
+        repository_row.addWidget(self.about_repository_btn)
+        about_app_layout.addLayout(repository_row)
+        about_layout.addWidget(about_app_group)
+
+        developer_group = QtWidgets.QGroupBox("Developer")
+        developer_group.setStyleSheet(section_style)
+        developer_layout = QtWidgets.QVBoxLayout(developer_group)
+        developer_layout.setContentsMargins(12, 12, 12, 14)
+        developer_layout.setSpacing(8)
+
+        self.author_avatar_label = QtWidgets.QLabel()
+        self.author_avatar_label.setFixedSize(112, 112)
+        self.author_avatar_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.author_avatar_label.setStyleSheet("background:transparent;border:none;")
+        self.author_avatar_label.setPixmap(self._make_author_avatar(size=112))
+        avatar_row = QtWidgets.QHBoxLayout()
+        avatar_row.addStretch(1)
+        avatar_row.addWidget(self.author_avatar_label)
+        avatar_row.addStretch(1)
+        developer_layout.addLayout(avatar_row)
+
+        self._author_image_load_started = True
+
+        author_name = QtWidgets.QLabel("Afnan Tawsif")
+        author_name.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        author_name.setStyleSheet("font-size:13pt;font-weight:700;color:#ffffff;")
+        developer_layout.addWidget(author_name)
+        developer_layout.addSpacing(8)
+
+        contact_row = QtWidgets.QHBoxLayout()
+        contact_row.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        contact_row.setSpacing(16)
+        self._make_about_contact_btn(
+            contact_row, fallback_text="f", bg="#1877F2", hover="#0d5bbf",
+            tooltip="Facebook", url="https://www.facebook.com/not.tawsif",
+            icon_name="facebook.svg", fallback_font_size="18pt")
+        self._make_about_contact_btn(
+            contact_row, fallback_text="ig", bg="#E1306C", hover="#b02454",
+            tooltip="Instagram", url="https://www.instagram.com/_hey_tawsif_",
+            icon_name="insta.svg", fallback_font_size="12pt")
+        self._make_about_contact_btn(
+            contact_row, fallback_text="✈", bg="#229ED9", hover="#1c7fb0",
+            tooltip="Telegram", url="https://t.me/KindaDeadNgl",
+            icon_name="telegram.svg", fallback_font_size="15pt")
+        self._make_about_contact_btn(
+            contact_row, fallback_text="@", bg="#EA4335", hover="#b83228",
+            tooltip="Gmail", url="mailto:acer.only2001@gmail.com",
+            icon_name="gmail.svg", fallback_font_size="17pt")
+        developer_layout.addLayout(contact_row)
+        about_layout.addWidget(developer_group)
+        about_layout.addStretch(1)
+        self.tabs.addTab(self.about_scroll, "About")
+
         self.tabs.setCurrentIndex(0)
 
         bottom = QtWidgets.QHBoxLayout()
@@ -45205,6 +47510,7 @@ class AppSettingsPage(QtWidgets.QWidget):
 
         self._loading_form = False
         self._saved_settings = self._form_settings()
+        self.tabs.currentChanged.connect(self._on_settings_tab_changed)
 
         for widget_signal in (
             self.thumb_processes.valueChanged,
@@ -45223,6 +47529,229 @@ class AppSettingsPage(QtWidgets.QWidget):
             widget_signal.connect(self._mark_dirty)
 
         self._load_from_app_settings()
+
+    @staticmethod
+    def _make_author_avatar(size=112):
+        """Load icons/author.jpg, using the active icons/author.svg as the fallback.
+
+        TEST MODE deliberately reads author.svg from disk, just like other editable
+        SVG resources. If the file is missing, create it from the current embedded
+        fallback first, then load that disk file. Do not silently render the embedded
+        copy over a test-mode disk resource.
+        """
+        source = QtGui.QPixmap()
+        author_jpg = os.path.join(ICONS_FOLDER, "author.jpg")
+        try:
+            loaded = os.path.isfile(author_jpg) and source.load(author_jpg)
+        except Exception:
+            loaded = False
+
+        if not loaded:
+            fallback_path = os.path.join(ICONS_FOLDER, "author.svg")
+            if MERGERZ_TEST_MODE and not os.path.isfile(fallback_path):
+                _ensure_icons_exist()
+
+            renderer = None
+            if QSvgRenderer is not None:
+                try:
+                    if os.path.isfile(fallback_path):
+                        renderer = QSvgRenderer(fallback_path)
+                    # Only the installed/release mode may fall back directly to
+                    # embedded SVG bytes if packaged files are unexpectedly missing.
+                    if (not MERGERZ_TEST_MODE and
+                            (renderer is None or not renderer.isValid())):
+                        renderer = QSvgRenderer(QtCore.QByteArray(
+                            _AUTHOR_FALLBACK_SVG.encode("utf-8")))
+                except Exception:
+                    renderer = None
+
+            source = QtGui.QPixmap(size, size)
+            source.fill(QtCore.Qt.GlobalColor.transparent)
+            painter = QtGui.QPainter(source)
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            if renderer is not None and renderer.isValid():
+                renderer.render(painter, QtCore.QRectF(0, 0, size, size))
+            else:
+                # Last-resort runtime-only drawing if the SVG file is unavailable or
+                # invalid. In TEST MODE, this does not write or prefer another SVG.
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                painter.setBrush(QtGui.QColor("#282b30"))
+                painter.drawEllipse(0, 0, size - 1, size - 1)
+                painter.setBrush(QtGui.QColor("#707984"))
+                painter.drawEllipse(size * .33, size * .20, size * .34, size * .34)
+                painter.drawRoundedRect(size * .15, size * .62, size * .70, size * .35, size * .22, size * .22)
+            painter.end()
+
+        scaled = source.scaled(
+            size, size,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        x = max(0, (scaled.width() - size) // 2)
+        y = max(0, (scaled.height() - size) // 2)
+        circular = QtGui.QPixmap(size, size)
+        circular.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(circular)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        path = QtGui.QPainterPath()
+        path.addEllipse(1, 1, size - 2, size - 2)
+        painter.setClipPath(path)
+        painter.drawPixmap(QtCore.QRect(0, 0, size, size), scaled,
+                           QtCore.QRect(x, y, size, size))
+        painter.setClipping(False)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#454545"), 1.5))
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(1, 1, size - 2, size - 2)
+        painter.end()
+        return circular
+
+    def _make_about_contact_btn(self, parent_layout, fallback_text, bg, hover,
+                                tooltip, url, icon_name=None,
+                                fallback_font_size="16pt"):
+        """Use the same round contact buttons and links as the main-menu footer."""
+        btn = QtWidgets.QPushButton()
+        btn.setFixedSize(46, 46)
+        btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg}; color: white;
+                border: none; border-radius: 23px;
+                font-size: {fallback_font_size}; font-weight: bold;
+            }}
+            QPushButton:hover {{ background-color: {hover}; }}
+            QPushButton:pressed {{ background-color: {hover}; }}
+        """)
+        icon_loaded = False
+        if icon_name:
+            icon = _render_svg_icon(os.path.join(ICONS_FOLDER, icon_name), size=26)
+            if icon is not None:
+                btn.setIcon(icon)
+                btn.setIconSize(QtCore.QSize(26, 26))
+                icon_loaded = True
+        if not icon_loaded:
+            btn.setText(fallback_text)
+        btn.clicked.connect(lambda _, target=url:
+                            QtGui.QDesktopServices.openUrl(QtCore.QUrl(target)))
+        parent_layout.addWidget(btn)
+        return btn
+
+    def _on_settings_tab_changed(self, index):
+        if self.tabs.widget(index) is self.about_scroll:
+            self._ensure_author_image_loaded()
+
+    def _ensure_author_image_loaded(self):
+        """Load the developer image only from the active icons directory; never use the network."""
+        if self._author_image_load_started:
+            return
+        self._author_image_load_started = True
+        self.author_avatar_label.setPixmap(self._make_author_avatar(size=112))
+        self.author_avatar_label.setToolTip("Afnan Tawsif")
+
+    def _open_changelog_dialog(self):
+        ChangelogDialog(self).exec()
+
+    def _open_faq_dialog(self):
+        FAQDialog(self).exec()
+
+    def _on_about_update_button_clicked(self):
+        mode = getattr(self, "_about_update_button_mode", "check")
+        if mode == "update":
+            if self._about_update_version:
+                self.mergerz_update_requested.emit(self._about_update_version)
+        elif mode == "check":
+            self.mergerz_update_check_requested.emit()
+
+    def _set_about_update_button(self, text, mode, *, enabled, blue=False, tooltip=""):
+        self._about_update_button_mode = mode
+        self.about_check_update_btn.setText(str(text))
+        self.about_check_update_btn.setEnabled(bool(enabled))
+        style = self._ABOUT_BLUE_BUTTON_STYLE if blue else self._ABOUT_DARK_BUTTON_STYLE
+        self.about_check_update_btn.setStyleSheet(style)
+        self.about_check_update_btn.setToolTip(str(tooltip or ""))
+
+    def _restore_about_check_button(self, expected_mode):
+        # A delayed reset must never overwrite a newer check/update/install state.
+        if getattr(self, "_about_update_button_mode", None) != expected_mode:
+            return
+        self._set_about_update_button("Check updates", "check", enabled=True)
+
+    def reset_about_update_state(self):
+        """Discard a previous Settings-session result and return to the manual check action."""
+        self._about_update_version = ""
+        self._about_current_version = _installed_mergerz_version()
+        self.about_current_version_label.setText(f"v{self._about_current_version}")
+        self.about_current_version_label.setStyleSheet(
+            "color:#b7d8ff;font-size:10pt;font-weight:700;")
+        self._set_about_update_button("Check updates", "check", enabled=True)
+
+    def set_about_update_checking(self):
+        self._about_update_version = ""
+        self._about_current_version = _installed_mergerz_version()
+        self.about_current_version_label.setText(f"v{self._about_current_version}")
+        self.about_current_version_label.setStyleSheet(
+            "color:#b7d8ff;font-size:10pt;font-weight:700;")
+        self._set_about_update_button("Checking...", "checking", enabled=False)
+
+    def set_about_update_available(self, version):
+        version = str(version or "").strip()
+        self._about_update_version = version
+        if not version:
+            self.set_about_update_error("No valid update version was returned.")
+            return
+        current_version = str(
+            getattr(self, "_about_current_version", "") or _installed_mergerz_version()
+        ).strip()
+        self.about_current_version_label.setText(f"v{current_version}  →  v{version}")
+        self.about_current_version_label.setStyleSheet(
+            "color:#b7d8ff;font-size:10pt;font-weight:700;")
+        self._set_about_update_button(
+            "Update", "update", enabled=True, blue=True,
+            tooltip=f"Update Mergerz to v{version}",
+        )
+
+    def set_about_update_up_to_date(self, current_version):
+        self._about_update_version = ""
+        current_version = str(current_version or _installed_mergerz_version()).strip()
+        self._about_current_version = current_version
+        self.about_current_version_label.setText(f"v{current_version}")
+        self.about_current_version_label.setStyleSheet(
+            "color:#b7d8ff;font-size:10pt;font-weight:700;")
+        self._set_about_update_button("No updates found", "no_updates", enabled=False)
+        QtCore.QTimer.singleShot(
+            3000, lambda: self._restore_about_check_button("no_updates")
+        )
+
+    def set_about_update_error(self, message="Couldn't check for updates. Check your connection and try again."):
+        self._about_update_version = ""
+        current_version = str(
+            getattr(self, "_about_current_version", "") or _installed_mergerz_version()
+        ).strip()
+        self.about_current_version_label.setText(f"v{current_version}")
+        self.about_current_version_label.setStyleSheet(
+            "color:#b7d8ff;font-size:10pt;font-weight:700;")
+        error = str(message or "Couldn't check for updates.")
+        self._set_about_update_button(
+            "Check failed", "error", enabled=False, tooltip=error
+        )
+        QtCore.QTimer.singleShot(
+            3000, lambda: self._restore_about_check_button("error")
+        )
+
+    def set_about_update_installing(self, version):
+        version = str(version or self._about_update_version or "").strip()
+        current_version = str(
+            getattr(self, "_about_current_version", "") or _installed_mergerz_version()
+        ).strip()
+        if version:
+            self.about_current_version_label.setText(f"v{current_version}  →  v{version}")
+        self._set_about_update_button("Updating...", "installing", enabled=False, blue=True)
+
+    def set_about_update_restarting(self, version):
+        version = str(version or "").strip()
+        if version:
+            self.about_current_version_label.setText(f"v{version}")
+        self._set_about_update_button("Restarting...", "restarting", enabled=False)
 
     def _form_mp(self):
         return {
@@ -46624,13 +49153,6 @@ class EditPdfChoiceDialog(QtWidgets.QDialog):
 # LibreOffice format display metadata for extensions returned by the live runtime catalog.
 # This map supplies labels only; it does not define converter capabilities or routes.
 
-def _lo_filter_for_ext(ext):
-    """Build a neutral file-dialog filter from the runtime-provided extension."""
-    ext = str(ext or "").strip().lower()
-    if not ext:
-        return "*.*", ""
-    bare = ext.lstrip(".").upper()
-    return f"{bare} Files (*{ext})", bare
 
 
 
@@ -47352,7 +49874,14 @@ class PluginsPage(QtWidgets.QWidget):
         self._scan_thread = None
         self._operation_thread = None
         self._update_check_thread = None
+        self._uv_update_check_thread = None
         self._reload_angle = 0
+        self._python_runtime_catalog = {
+            "source": "fallback",
+            OCR_PLUGIN_ID: list(_PYTHON_RUNTIME_FALLBACK_CATALOG[OCR_PLUGIN_ID]),
+            PDF2DOCX_PLUGIN_ID: list(_PYTHON_RUNTIME_FALLBACK_CATALOG[PDF2DOCX_PLUGIN_ID]),
+        }
+        self._python_runtime_combos = {}
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 20)
@@ -47368,12 +49897,18 @@ class PluginsPage(QtWidgets.QWidget):
         title_row.addWidget(title)
         outer.addLayout(title_row)
 
-        # Dedicated action row below the title.  Keeping this row separate makes
-        # the hierarchy: title -> actions -> plugin list visually explicit.
+        # The UV version/update control shares the toolbar row with the three
+        # right-aligned plugin actions. This keeps the page title centered and
+        # avoids spending a separate row on UV metadata.
+        self.uv_package_label = QtWidgets.QLabel()
+        self.uv_package_label.setStyleSheet(
+            "color:#d0d0d0; font-size:10pt; font-weight:600; background:transparent; border:none;"
+        )
+
         actions_row = QtWidgets.QHBoxLayout()
         actions_row.setContentsMargins(0, 0, 0, 0)
         actions_row.setSpacing(8)
-        actions_row.addStretch(1)
+        actions_row.addWidget(self.uv_package_label)
 
         # One combined text button: white open-pdf icon + text.  A leading space
         # supplies a small deliberate visual gap between the icon and the label.
@@ -47397,6 +49932,33 @@ class PluginsPage(QtWidgets.QWidget):
             QPushButton:pressed { background:#202020; }
         """)
         self.view_location_btn.clicked.connect(self._open_plugin_location)
+
+        # Check for UV updates only after an explicit user action; never check at startup or menu-open.
+        self.uv_update_btn = QtWidgets.QPushButton()
+        self.uv_update_btn.setFixedSize(38, 38)
+        self.uv_update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.uv_update_btn.setToolTip("Check for UV updates")
+        self.uv_update_btn.setAccessibleName("Check for UV Updates")
+        uv_icon = _render_svg_icon(os.path.join(ICONS_FOLDER, "uv-update.svg"), size=18)
+        if uv_icon is not None:
+            self.uv_update_btn.setIcon(uv_icon)
+            self.uv_update_btn.setIconSize(QtCore.QSize(18, 18))
+        self.uv_update_btn.setStyleSheet("""
+            QPushButton {
+                background:#242424; color:#f0f0f0;
+                border:1px solid #373737; border-radius:8px;
+                padding:6px 12px; font-weight:600;
+            }
+            QPushButton:hover { background:#303030; border-color:#4a4a4a; }
+            QPushButton:pressed { background:#202020; }
+            QPushButton:disabled { background:#202020; border-color:#2d2d2d; color:#666; }
+        """)
+        self.uv_update_btn.clicked.connect(self._check_uv_updates_clicked)
+        actions_row.addWidget(self.uv_update_btn)
+        self._refresh_uv_package_header()
+
+        # Keep the three plugin actions grouped at the right edge of the toolbar.
+        actions_row.addStretch(1)
         actions_row.addWidget(self.view_location_btn)
 
         # Check all installed plugins without modifying them; use the same update.svg
@@ -47521,6 +50083,21 @@ class PluginsPage(QtWidgets.QWidget):
         self._reload_spin_timer.setInterval(30)
         self._reload_spin_timer.timeout.connect(self._tick_reload_spin)
 
+    def _refresh_uv_package_header(self):
+        """Show the UV package version currently verified in the Mergerz environment."""
+        info = _uv_current_info()
+        version = str((info or {}).get("version") or "").strip()
+        if version:
+            self.uv_package_label.setText(f"UV Package Manager {version}")
+            self.uv_package_label.setToolTip(
+                "UV is installed in Mergerz's Python environment and manages plugin packages."
+            )
+        else:
+            self.uv_package_label.setText("UV Package Manager unavailable")
+            self.uv_package_label.setToolTip(
+                "The UV package or executable could not be verified in the current Mergerz environment."
+            )
+
     def _set_reload_icon(self, angle):
         icon_path = os.path.join(ICONS_FOLDER, "reload.svg")
         icon = _render_svg_icon_rotated(icon_path, 18, angle)
@@ -47568,6 +50145,7 @@ class PluginsPage(QtWidgets.QWidget):
             pass
 
     def _clear_list(self):
+        self._python_runtime_combos.clear()
         while self.list_layout.count():
             item = self.list_layout.takeAt(0)
             widget = item.widget()
@@ -47587,6 +50165,8 @@ class PluginsPage(QtWidgets.QWidget):
         if self._operation_thread is not None and self._operation_thread.isRunning():
             return
         if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            return
+        if self._uv_update_check_thread is not None and self._uv_update_check_thread.isRunning():
             return
 
         self._clear_list()
@@ -47627,7 +50207,7 @@ class PluginsPage(QtWidgets.QWidget):
             self._stop_reload_animation()
         except Exception:
             pass
-        for attr in ("_update_check_thread", "_operation_thread", "_scan_thread"):
+        for attr in ("_uv_update_check_thread", "_update_check_thread", "_operation_thread", "_scan_thread"):
             thread = getattr(self, attr, None)
             if thread is None:
                 continue
@@ -47653,6 +50233,7 @@ class PluginsPage(QtWidgets.QWidget):
     def _display_library_name(name):
         return {
             "paddleocr": "PaddleOCR",
+            "paddlepaddle": "PaddlePaddle",
             "onnxruntime": "ONNX Runtime",
             "onnxruntime-gpu": "ONNX Runtime GPU",
             "pdf2docx": "PDF2DOCX",
@@ -47753,6 +50334,84 @@ class PluginsPage(QtWidgets.QWidget):
         )
         return lbl
 
+    def _make_python_runtime_combo(self, plugin_id):
+        combo = QtWidgets.QComboBox()
+        combo.setFixedSize(150, 32)
+        combo.setAccessibleName(f"{_plugin_update_display_name(plugin_id)} Python Runtime")
+        combo.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(15)
+        combo.setToolTip(
+            "Choose the Python interpreter for this installation. Current uses the exact "
+            "interpreter that launched Mergerz; Python x.y uses UV-managed CPython. "
+            "Both choices use UV for package installation."
+        )
+        combo.setStyleSheet("""
+            QComboBox {
+                background:#242424; color:#e6e6e6; border:1px solid #3a3a3a;
+                border-radius:7px; padding:5px 7px; font-size:9pt;
+            }
+            QComboBox:hover { border-color:#5a5a5a; }
+            QComboBox:focus { border-color:#0078d7; }
+            QComboBox::drop-down { border:none; width:20px; }
+            QComboBox QAbstractItemView {
+                background:#242424; color:#e6e6e6; selection-background-color:#315b82;
+                border:1px solid #3a3a3a; outline:none;
+            }
+        """)
+        # Installation choices are deliberately temporary until the user confirms
+        # installation. Always start from the product default when a plugin is absent:
+        # OCR -> UV-managed 3.13; PDF2DOCX -> the exact Current interpreter.
+        # Older saved preferences must not override these first-install defaults.
+        selected = _PYTHON_RUNTIME_DEFAULTS.get(plugin_id, _PYTHON_RUNTIME_CURRENT)
+        _populate_python_runtime_combo(
+            combo, plugin_id, self._python_runtime_catalog, selected,
+        )
+        source = str((self._python_runtime_catalog or {}).get("source") or "fallback")
+        if source == "uv":
+            combo.setToolTip(combo.toolTip() + "\nManaged Python versions were read from UV's catalogue.")
+        else:
+            combo.setToolTip(combo.toolTip() + "\nFallback Python choices are shown because UV's catalogue could not be read.")
+        combo.currentIndexChanged.connect(
+            lambda _index, box=combo, pid=plugin_id:
+                self._python_runtime_changed(pid, box)
+        )
+        self._python_runtime_combos[plugin_id] = combo
+        return combo
+
+    def _python_runtime_changed(self, plugin_id, combo):
+        """Update the hint only; do not persist a choice until installation is confirmed."""
+        selection = str(combo.currentData() or "").strip().lower()
+        if selection == _PYTHON_RUNTIME_CURRENT:
+            combo.setToolTip(
+                "Current uses the exact interpreter that launched Mergerz. "
+                "This temporary choice is used only if you confirm installation."
+            )
+        else:
+            combo.setToolTip(
+                f"Python {selection} uses UV-managed CPython. "
+                "This temporary choice is used only if you confirm installation."
+            )
+
+    def _confirm_uv_for_runtime_choices(self, plugin_ids):
+        """Ensure Python-plugin operations can use the UV dependency in this environment."""
+        python_plugins = sorted({
+            plugin_id for plugin_id in (plugin_ids or [])
+            if plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID}
+        })
+        if not python_plugins or _uv_current_info():
+            return True
+        QtWidgets.QMessageBox.warning(
+            self,
+            "UV Dependency Unavailable",
+            "UV is a required Mergerz dependency, but its package or executable could not be verified "
+            "in the Python environment running Mergerz.\n\n"
+            "Repair the installation in that same environment with:\n"
+            "python -m pip install --upgrade mergerz\n\n"
+            "Then restart Mergerz and retry the operation.",
+        )
+        return False
+
     def _make_plugin_card(self, status):
         card = QtWidgets.QFrame()
         card.setObjectName("pluginCard")
@@ -47814,6 +50473,20 @@ class PluginsPage(QtWidgets.QWidget):
         name.setStyleSheet(
             "font-size:13pt; font-weight:bold; color:#ffffff;"
             "background:transparent; border:none;")
+        name_row = QtWidgets.QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(8)
+        name_row.addWidget(name)
+        if status.get("installed"):
+            runtime_label = QtWidgets.QLabel(_python_runtime_display_text(status))
+            runtime_label.setStyleSheet(
+                "font-size:8.5pt; font-weight:600; color:#c4b5fd;"
+                "background:transparent; border:none;")
+            runtime_label.setToolTip(
+                "Actual Python version inside the installed OCR environment."
+            )
+            name_row.addWidget(runtime_label)
+        name_row.addStretch(1)
         desc = QtWidgets.QLabel(
             "Scan selected PDF pages and add selectable text")
         desc.setWordWrap(True)
@@ -47826,13 +50499,15 @@ class PluginsPage(QtWidgets.QWidget):
             "color:#6fa8dc; font-size:9pt;"
             "background:transparent; border:none;")
 
-        text_col.addWidget(name)
+        text_col.addLayout(name_row)
         text_col.addWidget(desc)
         text_col.addWidget(libraries)
         row.addLayout(text_col, 1)
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(7)
+        if not status.get("installed"):
+            actions.addWidget(self._make_python_runtime_combo(OCR_PLUGIN_ID))
         if status.get("installed"):
             actions.addWidget(
                 self._status_text(
@@ -47982,6 +50657,19 @@ class PluginsPage(QtWidgets.QWidget):
         name = QtWidgets.QLabel("PDF to DOCX")
         name.setStyleSheet(
             "font-size:13pt; font-weight:bold; color:#ffffff; background:transparent; border:none;")
+        name_row = QtWidgets.QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(8)
+        name_row.addWidget(name)
+        if status.get("installed"):
+            runtime_label = QtWidgets.QLabel(_python_runtime_display_text(status))
+            runtime_label.setStyleSheet(
+                "font-size:8.5pt; font-weight:600; color:#c4b5fd; background:transparent; border:none;")
+            runtime_label.setToolTip(
+                "Actual Python version inside the installed PDF2DOCX environment."
+            )
+            name_row.addWidget(runtime_label)
+        name_row.addStretch(1)
         desc = QtWidgets.QLabel("Convert PDF files to editable DOCX documents")
         desc.setWordWrap(True)
         desc.setStyleSheet(
@@ -47990,13 +50678,15 @@ class PluginsPage(QtWidgets.QWidget):
         libraries.setWordWrap(True)
         libraries.setStyleSheet(
             "color:#6fa8dc; font-size:9pt; background:transparent; border:none;")
-        text_col.addWidget(name)
+        text_col.addLayout(name_row)
         text_col.addWidget(desc)
         text_col.addWidget(libraries)
         row.addLayout(text_col, 1)
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(7)
+        if not status.get("installed"):
+            actions.addWidget(self._make_python_runtime_combo(PDF2DOCX_PLUGIN_ID))
         if status.get("installed"):
             actions.addWidget(
                 self._status_text(
@@ -48102,6 +50792,9 @@ class PluginsPage(QtWidgets.QWidget):
         self.plugin_spinner.hide()
         self._clear_list()
         if isinstance(status, dict) and "ocr" in status:
+            catalog = status.get("python_runtime_catalog")
+            if isinstance(catalog, dict):
+                self._python_runtime_catalog = catalog
             self.list_layout.addWidget(self._make_plugin_card(status.get("ocr") or {}))
             self.list_layout.addWidget(
                 self._make_pdf2docx_card(status.get("pdf2docx") or {}))
@@ -48111,18 +50804,21 @@ class PluginsPage(QtWidgets.QWidget):
             # Backstop for any caller still providing the legacy OCR-only status dict.
             self.list_layout.addWidget(self._make_plugin_card(status or {}))
         note = QtWidgets.QLabel(
-            "Each plugin is installed per-user in its own isolated environment or bundled runtime directory.")
+            "Each plugin is installed per-user in its own isolated environment or bundled runtime directory. "
+            "Current reuses Mergerz's Python interpreter; UV-managed uses a separate interpreter, and both use UV for packages.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#777; font-size:9pt; padding:4px 2px 2px 2px; border:none;")
         self.list_layout.addWidget(note)
         self.content_stack.setCurrentWidget(self.list_page)
 
-    def _run_operation(self, task, title, success_text, initial_state=None, refresh=True, show_result=True):
+    def _run_operation(self, task, title, success_text, initial_state=None, refresh=True, show_result=True, cancel_enabled=True):
         if _APP_SHUTTING_DOWN:
+            return
+        if self._uv_update_check_thread is not None and self._uv_update_check_thread.isRunning():
             return
         if self._operation_thread is not None and self._operation_thread.isRunning():
             return
-        dialog = ProgressDialog(self, cancel_enabled=True)
+        dialog = ProgressDialog(self, cancel_enabled=bool(cancel_enabled))
         dialog.setWindowTitle(title)
         initial_state = initial_state or ("Working..." if not str(title).lower().startswith("updating ") else "Preparing update...")
         dialog.start_infinite(initial_state)
@@ -48135,7 +50831,8 @@ class PluginsPage(QtWidgets.QWidget):
         thread.infinite_signal.connect(
             lambda visible, label: dialog.start_infinite(label) if visible
             else dialog.stop_infinite())
-        dialog.cancel_button.clicked.connect(thread.request_cancel)
+        if cancel_enabled:
+            dialog.cancel_button.clicked.connect(thread.request_cancel)
         outcome = {"result": None, "error": None, "cancelled": False}
 
         def on_done(result):
@@ -48235,11 +50932,12 @@ class PluginsPage(QtWidgets.QWidget):
 
     def _set_update_check_busy(self, busy):
         self.check_all_updates_btn.setEnabled(not busy)
+        self.uv_update_btn.setEnabled(not busy)
         self.reload_btn.setEnabled(not busy)
 
     def _format_update_entries(self, result):
         entries = []
-        preferred_order = ("paddleocr", "onnxruntime", "onnxruntime-gpu", "pdf2docx", "libreoffice")
+        preferred_order = ("paddleocr", "paddlepaddle", "onnxruntime", "onnxruntime-gpu", "pdf2docx", "libreoffice")
         updates = result.get("updates") or {}
         ordered_packages = sorted(
             updates,
@@ -48279,12 +50977,19 @@ class PluginsPage(QtWidgets.QWidget):
     def _start_update_install(self, result):
         plugin_id = result.get("plugin_id")
         plugin_name = str(result.get("plugin") or _plugin_update_display_name(plugin_id))
+        if plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID}:
+            if not self._confirm_uv_for_runtime_choices([plugin_id]):
+                return
         if plugin_id == OCR_PLUGIN_ID:
-            task = _OCRUpdateTask(update_info=result)
+            task = _OCRUpdateTask(
+                update_info=result, python_selection=result.get("python_selection")
+            )
             title = "Updating OCR Plugin"
             success = "OCR was updated, verified, and the new isolated environment is ready to use."
         elif plugin_id == PDF2DOCX_PLUGIN_ID:
-            task = _Pdf2DocxUpdateTask(update_info=result)
+            task = _Pdf2DocxUpdateTask(
+                update_info=result, python_selection=result.get("python_selection")
+            )
             title = "Updating PDF2DOCX Plugin"
             success = "PDF to DOCX was updated, verified, and the new isolated environment is ready to use."
         elif plugin_id == LIBREOFFICE_PLUGIN_ID:
@@ -48309,6 +51014,139 @@ class PluginsPage(QtWidgets.QWidget):
     def _check_all_updates_clicked(self):
         self._begin_update_check(None)
 
+    def _check_uv_updates_clicked(self):
+        """Manually check PyPI, then update the UV dependency installed with Mergerz."""
+        if _APP_SHUTTING_DOWN:
+            return
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            return
+        if self._operation_thread is not None and self._operation_thread.isRunning():
+            return
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            return
+        if self._uv_update_check_thread is not None and self._uv_update_check_thread.isRunning():
+            return
+
+        dialog = ProgressDialog(self, cancel_enabled=True)
+        dialog.setWindowTitle("Checking for UV Updates")
+        dialog.start_infinite("Checking for UV updates...")
+        dialog.show()
+        QtWidgets.QApplication.processEvents(
+            QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 10)
+
+        task = _UVPackageUpdateCheckTask()
+        thread = PluginTaskThread(task, dialog)
+        self._uv_update_check_thread = thread
+        self.uv_update_btn.setEnabled(False)
+        thread.log_signal.connect(dialog.append_log)
+        thread.progress_signal.connect(dialog.set_progress)
+        thread.infinite_signal.connect(
+            lambda visible, label: dialog.start_infinite(label)
+            if visible else dialog.stop_infinite())
+        dialog.cancel_button.clicked.connect(thread.request_cancel)
+        outcome = {"result": None, "error": None, "cancelled": False}
+
+        def on_done(result):
+            if outcome["cancelled"]:
+                return
+            outcome["result"] = result
+            dialog.accept()
+
+        def on_error(message):
+            if outcome["cancelled"]:
+                return
+            outcome["error"] = message
+            dialog.append_log(message, "error")
+            dialog.accept()
+
+        def on_cancelled():
+            if outcome["cancelled"]:
+                return
+            outcome["cancelled"] = True
+            dialog.accept()
+
+        thread.result_signal.connect(on_done)
+        thread.error_signal.connect(on_error)
+        thread.cancelled_signal.connect(on_cancelled)
+
+        def on_finished():
+            self._uv_update_check_thread = None
+            self.uv_update_btn.setEnabled(True)
+            if _APP_SHUTTING_DOWN:
+                return
+            if outcome["cancelled"]:
+                ResultDialog(
+                    False, "UV update check aborted by user.", dialog.logs, self,
+                    title_text="UV Update Check Aborted",
+                ).exec()
+                return
+            if outcome["error"]:
+                ResultDialog(
+                    False, f"Checking for UV updates failed:\n{outcome['error']}",
+                    dialog.logs, self, title_text="UV Update Check Failed",
+                ).exec()
+                return
+
+            result = outcome["result"] or {}
+            if result.get("missing_uv"):
+                ResultDialog(
+                    False,
+                    "UV is a required dependency, but its package or executable could not be verified "
+                    "in the Python environment running Mergerz.\n\n"
+                    "Repair that same environment with:\n"
+                    "python -m pip install --upgrade mergerz\n\n"
+                    "Then restart Mergerz. UV is supplied by the Mergerz Python package installation.",
+                    dialog.logs, self, title_text="UV Dependency Unavailable",
+                ).exec()
+                return
+
+            if result.get("no_update"):
+                message = (
+                    f"UV {result.get('current_version')} is already up to date.\n\n"
+                    f"Latest stable version on PyPI: {result.get('latest_version')}"
+                )
+                ResultDialog(True, message, dialog.logs, self, title_text="UV is Up to Date").exec()
+                return
+
+            if result.get("update_available"):
+                current = str(result.get("current_version") or "unknown")
+                latest = str(result.get("latest_version") or "unknown")
+                answer = QtWidgets.QMessageBox.question(
+                    self,
+                    "UV Update Available",
+                    f"A newer UV package is available.\n\n"
+                    f"Installed: {current}\nAvailable: {latest}\n\n"
+                    "Update UV in the currently running Mergerz Python environment now?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.Yes,
+                )
+                if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+                    self._run_operation(
+                        _UVPackageUpdateTask(latest),
+                        "Updating UV",
+                        f"UV was updated to {latest} and verified in the Mergerz Python environment.",
+                        initial_state=f"Preparing UV {latest}...",
+                        refresh=False,
+                        cancel_enabled=False,
+                    )
+                    self._refresh_uv_package_header()
+                else:
+                    ResultDialog(
+                        False,
+                        f"UV {latest} is available, but no changes were made.\n\n"
+                        f"Installed version: {current}",
+                        dialog.logs, self, title_text="UV Update Deferred",
+                    ).exec()
+
+        thread.finished.connect(on_finished)
+        thread.start()
+        dialog.exec()
+        if thread.isRunning():
+            _stop_qthread(
+                thread, stop_callback=thread.request_cancel,
+                timeout_ms=5000, force_wait_ms=2000,
+            )
+
     def _begin_update_check(self, plugin_id):
         if _APP_SHUTTING_DOWN:
             return
@@ -48317,6 +51155,8 @@ class PluginsPage(QtWidgets.QWidget):
         if self._operation_thread is not None and self._operation_thread.isRunning():
             return
         if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            return
+        if self._uv_update_check_thread is not None and self._uv_update_check_thread.isRunning():
             return
 
         is_all = plugin_id is None
@@ -48397,12 +51237,36 @@ class PluginsPage(QtWidgets.QWidget):
                     )
                     return
                 confirm = PluginUpdateConfirmationDialog(
+                    plugin_id,
                     str(result.get("plugin") or _plugin_update_display_name(plugin_id)),
                     updates,
-                    self,
+                    python_runtime_catalog=self._python_runtime_catalog,
+                    selected_python=(
+                        _get_installed_python_runtime_selection(plugin_id)
+                        if plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID} else None
+                    ),
+                    parent=self,
                 )
                 if confirm.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                    self._start_update_install(result)
+                    selected_result = dict(result)
+                    selected_runtime = confirm.selected_python_runtime()
+                    if selected_runtime is not None:
+                        selected_result["python_selection"] = selected_runtime
+                        try:
+                            _set_python_runtime_selection(plugin_id, selected_runtime)
+                        except Exception as exc:
+                            QtWidgets.QMessageBox.warning(
+                                self, "Could Not Save Python Runtime",
+                                f"The selected Python runtime could not be saved:\n{type(exc).__name__}: {exc}",
+                            )
+                            return
+                    self._start_update_install(selected_result)
+                else:
+                    ResultDialog(
+                        False,
+                        f"{result.get('plugin') or _plugin_update_display_name(plugin_id)} update was deferred. No changes were made.",
+                        dialog.logs, self, title_text="Plugin Update Deferred",
+                    ).exec()
                 return
 
             plugin_results = result.get("plugins") or []
@@ -48439,13 +51303,40 @@ class PluginsPage(QtWidgets.QWidget):
                 return
 
             errors = result.get("errors") or {}
-            confirm = PluginUpdateSelectionDialog(entries, errors=errors, parent=self)
+            confirm = PluginUpdateSelectionDialog(
+                entries, errors=errors,
+                python_runtime_catalog=self._python_runtime_catalog,
+                parent=self,
+            )
             if confirm.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                ResultDialog(
+                    False,
+                    "Plugin updates were deferred. No changes were made.",
+                    dialog.logs, self, title_text="Plugin Updates Deferred",
+                ).exec()
                 return
             selected = confirm.selected_entries()
             if not selected:
+                ResultDialog(
+                    False,
+                    "No plugin updates were selected. No changes were made.",
+                    dialog.logs, self, title_text="Plugin Updates Deferred",
+                ).exec()
                 return
             selected_results = [entry["check_result"] for entry in selected]
+            for update_result in selected_results:
+                plugin_id = update_result.get("plugin_id")
+                selected_runtime = update_result.get("python_selection")
+                if plugin_id in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID} and selected_runtime:
+                    try:
+                        _set_python_runtime_selection(plugin_id, selected_runtime)
+                    except Exception as exc:
+                        QtWidgets.QMessageBox.warning(
+                            self, "Could Not Save Python Runtime",
+                            f"The selected Python runtime for {_plugin_update_display_name(plugin_id)} could not be saved:\n"
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                        return
             self._run_selected_plugin_updates(selected_results)
 
         thread.finished.connect(on_finished)
@@ -48453,6 +51344,12 @@ class PluginsPage(QtWidgets.QWidget):
         dialog.exec()
 
     def _run_selected_plugin_updates(self, selected_results):
+        python_plugin_ids = [
+            item.get("plugin_id") for item in (selected_results or [])
+            if item.get("plugin_id") in {OCR_PLUGIN_ID, PDF2DOCX_PLUGIN_ID}
+        ]
+        if not self._confirm_uv_for_runtime_choices(python_plugin_ids):
+            return
         task = _PluginBatchUpdateTask(selected_results)
         self._run_operation(
             task,
@@ -48462,6 +51359,10 @@ class PluginsPage(QtWidgets.QWidget):
         )
 
     def _install_clicked(self):
+        combo = self._python_runtime_combos.get(OCR_PLUGIN_ID)
+        selected_runtime = str(
+            combo.currentData() if combo is not None else _PYTHON_RUNTIME_DEFAULTS[OCR_PLUGIN_ID]
+        ).strip().lower()
         answer = QtWidgets.QMessageBox.question(
             self,
             "Install OCR Plugin",
@@ -48472,13 +51373,27 @@ class PluginsPage(QtWidgets.QWidget):
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        if not self._confirm_uv_for_runtime_choices([OCR_PLUGIN_ID]):
+            return
+        try:
+            _set_python_runtime_selection(OCR_PLUGIN_ID, selected_runtime)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could Not Save Python Runtime",
+                f"The selected Python runtime could not be saved:\n{type(exc).__name__}: {exc}",
+            )
+            return
         self._run_operation(
-            _PluginInstallerTask(OCR_PLUGIN_ID),
+            _PluginInstallerTask(OCR_PLUGIN_ID, python_selection=selected_runtime),
             "Installing OCR Plugin",
             "PaddleOCR and CPU OCR support are installed, verified, and ready to use.",
         )
 
     def _install_pdf2docx_clicked(self):
+        combo = self._python_runtime_combos.get(PDF2DOCX_PLUGIN_ID)
+        selected_runtime = str(
+            combo.currentData() if combo is not None else _PYTHON_RUNTIME_DEFAULTS[PDF2DOCX_PLUGIN_ID]
+        ).strip().lower()
         answer = QtWidgets.QMessageBox.question(
             self,
             "Install PDF2DOCX Plugin",
@@ -48488,8 +51403,18 @@ class PluginsPage(QtWidgets.QWidget):
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        if not self._confirm_uv_for_runtime_choices([PDF2DOCX_PLUGIN_ID]):
+            return
+        try:
+            _set_python_runtime_selection(PDF2DOCX_PLUGIN_ID, selected_runtime)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could Not Save Python Runtime",
+                f"The selected Python runtime could not be saved:\n{type(exc).__name__}: {exc}",
+            )
+            return
         self._run_operation(
-            _Pdf2DocxInstallerTask(),
+            _Pdf2DocxInstallerTask(python_selection=selected_runtime),
             "Installing PDF2DOCX Plugin",
             "PDF2DOCX is installed, verified, and ready to convert PDF files to DOCX.",
         )
@@ -48553,6 +51478,8 @@ class PluginsPage(QtWidgets.QWidget):
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        if not self._confirm_uv_for_runtime_choices([OCR_PLUGIN_ID]):
+            return
         self._run_operation(
             _PluginGpuSupportTask(install=True),
             "Installing GPU Acceleration",
@@ -48568,6 +51495,8 @@ class PluginsPage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.StandardButton.No,
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        if not self._confirm_uv_for_runtime_choices([OCR_PLUGIN_ID]):
             return
         self._run_operation(
             _PluginGpuSupportTask(install=False),
@@ -48595,9 +51524,10 @@ class PluginsPage(QtWidgets.QWidget):
 class _IndependentSettingsWindow(QtWidgets.QDialog):
     """Independent application-modal Settings window."""
     def __init__(self, page, parent=None):
-        # Deliberately do not parent this top-level window to MainWindow.
-        # ApplicationModal provides the same back-layer input lock as Edit PDF.
-        super().__init__(None)
+        # Keep the dialog as a separate top-level window. On Windows, retain
+        # MainWindow as its native owner so modal activation and overlap stacking
+        # follow the platform's owned-window rules; Linux keeps its previous setup.
+        super().__init__(parent if os.name == "nt" else None)
         self.page = page
         self._accepting_from_close_event = False
         self.setWindowTitle("Mergerz — Settings")
@@ -48640,9 +51570,9 @@ class _IndependentSettingsWindow(QtWidgets.QDialog):
 class _IndependentPluginsWindow(QtWidgets.QDialog):
     """Independent application-modal Plugins window."""
     def __init__(self, page, parent=None):
-        # Deliberately do not parent this top-level window to MainWindow.
-        # ApplicationModal keeps the main menu and Edit PDF blocked underneath.
-        super().__init__(None)
+        # Keep a separate top-level window. On Windows, use MainWindow as its
+        # native owner for dependable z-order and modal click routing.
+        super().__init__(parent if os.name == "nt" else None)
         self.page = page
         self.setWindowTitle("Mergerz — Plugins")
         self.setModal(True)
@@ -48677,7 +51607,10 @@ class _IndependentWorkflowWindow(QtWidgets.QDialog):
     """Independent application-modal workflow window used by Merge/Printable."""
     def __init__(self, title, pages, minimum_size=(1000, 720),
                  initial_size=(1180, 780), parent=None):
-        super().__init__(None)
+        # Separate top-level dialog, owned by MainWindow on Windows to avoid
+        # competing unowned windows in the native z-order. Other platforms keep
+        # the previous independent-window behavior.
+        super().__init__(parent if os.name == "nt" else None)
         self.setWindowTitle(title)
         self.setModal(True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
@@ -49027,6 +51960,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_plugin_conversion_thread = None
         self._active_workflow_window = None
         self._mergerz_update_check_thread = None
+        self._settings_mergerz_update_check_thread = None
         self._mergerz_update_install_thread = None
         self._mergerz_update_version = None
 
@@ -49048,11 +51982,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self.menu_page)
 
         self.settings_page = AppSettingsPage()
-        self.settings_window = _IndependentSettingsWindow(self.settings_page)
+        self.settings_page.mergerz_update_check_requested.connect(
+            self._begin_settings_mergerz_update_check)
+        self.settings_page.mergerz_update_requested.connect(
+            lambda version: self._start_mergerz_update(version, from_settings=True))
+        window_owner = self if os.name == "nt" else None
+        self.settings_window = _IndependentSettingsWindow(
+            self.settings_page, parent=window_owner)
         self.settings_window.hide()
 
         self.plugins_page = PluginsPage()
-        self.plugins_window = _IndependentPluginsWindow(self.plugins_page)
+        self.plugins_window = _IndependentPluginsWindow(
+            self.plugins_page, parent=window_owner)
         self.plugins_window.hide()
 
         self.merge_pdfs_page = MergePdfPage()
@@ -49063,7 +52004,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Mergerz — Merge PDFs",
             [self.merge_pdfs_page],
             minimum_size=(760, 640),
-            initial_size=(800, 700))
+            initial_size=(800, 700),
+            parent=window_owner)
         self.merge_pdfs_window.hide()
 
         self.merge_slides_page = FileSelectPage(
@@ -49083,7 +52025,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Mergerz — Make Printable Slides",
             [self.merge_slides_page, self.prefs_page],
             minimum_size=(760, 640),
-            initial_size=(800, 700))
+            initial_size=(800, 700),
+            parent=window_owner)
         self.merge_slides_window.hide()
 
         QtCore.QTimer.singleShot(80, self._initial_storage_refresh)
@@ -49094,9 +52037,77 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _maybe_open_startup_changelog(self):
+        """Open release notes once per installed Mergerz version, persisted in settings.json."""
+        global APP_SETTINGS
+        if _APP_SHUTTING_DOWN: return
+        current_version = str(_installed_mergerz_version() or __version__).strip()
+        with _SETTINGS_IO_LOCK:
+            app_state = APP_SETTINGS.get("app_state", {})
+            already_opened = str(app_state.get("auto_changelog_opened_version") or "").strip() if isinstance(app_state, dict) else ""
+            if already_opened == current_version: return
+            candidate = _get_app_settings_snapshot()
+            candidate["app_state"] = {"auto_changelog_opened_version": current_version}
+            if not _write_settings_file(candidate): APP_SETTINGS["app_state"] = candidate["app_state"]
+            else: APP_SETTINGS = candidate
+        ChangelogDialog(self).exec()
+
+    def _begin_settings_mergerz_update_check(self):
+        """Check for updates and report the result inside Settings instead of the footer."""
+        if _APP_SHUTTING_DOWN:
+            return
+        thread = self._settings_mergerz_update_check_thread
+        if thread is not None and thread.isRunning():
+            return
+        install_thread = self._mergerz_update_install_thread
+        if install_thread is not None and install_thread.isRunning():
+            self.settings_page.set_about_update_installing(
+                self._mergerz_update_version or _installed_mergerz_version())
+            return
+
+        self.settings_page.set_about_update_checking()
+        thread = PluginTaskThread(_MergerzUpdateCheckTask(), None)
+        self._settings_mergerz_update_check_thread = thread
+
+        def on_result(result):
+            if _APP_SHUTTING_DOWN:
+                return
+            result = result or {}
+            current = str(result.get("current_version") or _installed_mergerz_version())
+            self.settings_page._about_current_version = current
+            self.settings_page.about_current_version_label.setText(f"v{current}")
+            if result.get("update_available"):
+                latest = str(result.get("latest_version") or "").strip()
+                if latest:
+                    self._mergerz_update_version = latest
+                    self.settings_page.set_about_update_available(latest)
+                else:
+                    self._mergerz_update_version = None
+                    self.settings_page.set_about_update_error(
+                        "The update service returned an invalid version. Please try again.")
+            else:
+                self._mergerz_update_version = None
+                self.settings_page.set_about_update_up_to_date(current)
+
+        def on_error(_message):
+            if not _APP_SHUTTING_DOWN:
+                self.settings_page.set_about_update_error(
+                    "Couldn't check for updates. Check your connection and try again.")
+
+        def on_finished():
+            if self._settings_mergerz_update_check_thread is thread:
+                self._settings_mergerz_update_check_thread = None
+
+        thread.result_signal.connect(on_result)
+        thread.error_signal.connect(on_error)
+        thread.cancelled_signal.connect(
+            lambda: self.settings_page.set_about_update_error("Update check was cancelled."))
+        thread.finished.connect(on_finished)
+        thread.start()
+
     def _begin_mergerz_update_check(self):
         """Check for a newer Mergerz release after the main window is already visible."""
-        if MERGERZ_TEST_MODE or _APP_SHUTTING_DOWN:
+        if _APP_SHUTTING_DOWN:
             return
         thread = self._mergerz_update_check_thread
         if thread is not None and thread.isRunning():
@@ -49139,27 +52150,48 @@ class MainWindow(QtWidgets.QMainWindow):
         thread.finished.connect(on_finished)
         thread.start()
 
-    def _start_mergerz_update(self, requested_version=""):
-        """Install the exact advertised Mergerz release, then request an app restart."""
-        if MERGERZ_TEST_MODE or _APP_SHUTTING_DOWN:
+    def _start_mergerz_update(self, requested_version="", from_settings=False):
+        """Install the exact advertised release, using the initiating UI for its status."""
+        if _APP_SHUTTING_DOWN:
             return
 
         version = str(requested_version or self._mergerz_update_version or "").strip()
         if not version:
             return
         current_version = _installed_mergerz_version()
+        ui_parent = self._dialog_parent() if from_settings else self
         if not _version_is_newer(version, current_version):
-            self.menu_page.hide_mergerz_update_footer()
+            if from_settings:
+                self.settings_page.set_about_update_up_to_date(current_version)
+            else:
+                self.menu_page.hide_mergerz_update_footer()
             return
 
         thread = self._mergerz_update_install_thread
         if thread is not None and thread.isRunning():
             return
 
-        self._mergerz_update_version = version
-        self.menu_page.set_mergerz_update_installing()
+        if not _uv_current_info():
+            if from_settings:
+                self.settings_page.set_about_update_available(version)
+            QtWidgets.QMessageBox.warning(
+                ui_parent,
+                "UV Dependency Unavailable",
+                "Mergerz cannot update itself because the UV dependency is missing or broken in the "
+                "Python environment running the application.\n\n"
+                "Repair that same environment with:\n"
+                "python -m pip install --upgrade mergerz\n\n"
+                "Then restart Mergerz and retry the update.",
+            )
+            return
 
-        dialog = ProgressDialog(self, cancel_enabled=False)
+        self._mergerz_update_version = version
+        if from_settings:
+            self.settings_page.set_about_update_installing(version)
+        else:
+            self.menu_page.set_mergerz_update_installing()
+
+        dialog = ProgressDialog(ui_parent, cancel_enabled=False)
         dialog.setWindowTitle("Updating Mergerz")
         dialog.start_infinite(f"Installing Mergerz v{version}...")
         dialog.append_log(
@@ -49224,16 +52256,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mergerz_update_install_thread = None
 
             if outcome["cancelled"]:
-                self.menu_page.show_mergerz_update_available(version)
+                if from_settings:
+                    self.settings_page.set_about_update_available(version)
+                else:
+                    self.menu_page.show_mergerz_update_available(version)
                 return
 
             if outcome["error"]:
-                self.menu_page.show_mergerz_update_available(version)
+                if from_settings:
+                    self.settings_page.set_about_update_available(version)
+                else:
+                    self.menu_page.show_mergerz_update_available(version)
                 ResultDialog(
                     False,
                     f"Mergerz update failed:\n{outcome['error']}",
                     dialog.logs,
-                    self,
+                    ui_parent,
                     title_text="Mergerz Update Failed",
                 ).exec()
                 return
@@ -49251,13 +52289,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.menu_page.mergerz_update_footer.hide()
                 except Exception:
                     pass
+                if from_settings:
+                    self.settings_page.set_about_update_restarting(version)
             else:
-                self.menu_page.show_mergerz_update_available(version)
+                if from_settings:
+                    self.settings_page.set_about_update_available(version)
+                else:
+                    self.menu_page.show_mergerz_update_available(version)
                 ResultDialog(
                     False,
                     "Mergerz was not restarted because the update could not be verified.",
                     dialog.logs,
-                    self,
+                    ui_parent,
                     title_text="Mergerz Update Incomplete",
                 ).exec()
 
@@ -49275,7 +52318,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 and result.get("ok") and result.get("restart_required")):
             global _RESTART_AFTER_UPDATE
             _RESTART_AFTER_UPDATE = True
-            QtCore.QTimer.singleShot(0, QtWidgets.QApplication.quit)
+
+            def _finish_for_update_restart():
+                # Settings is itself running a nested QDialog.exec(). Close that modal loop
+                # first; otherwise the main QApplication loop can remain alive until the user
+                # manually closes Settings, leaving the UI stuck on "Restarting...".
+                if from_settings:
+                    try:
+                        if self.settings_window.isVisible():
+                            self.settings_window.done(QtWidgets.QDialog.DialogCode.Accepted)
+                    except Exception:
+                        pass
+                QtCore.QTimer.singleShot(0, QtWidgets.QApplication.quit)
+
+            QtCore.QTimer.singleShot(0, _finish_for_update_restart)
 
     def closeEvent(self, event):
         # Shutdown is deliberately split into two phases.  Stop background/native
@@ -49308,6 +52364,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            if (self._settings_mergerz_update_check_thread is not None
+                    and self._settings_mergerz_update_check_thread.isRunning()):
+                self._settings_mergerz_update_check_thread.request_cancel()
+                _stop_qthread(self._settings_mergerz_update_check_thread, timeout_ms=2000, force_wait_ms=1000)
+        except Exception:
+            pass
+        try:
             if (self._mergerz_update_install_thread is not None
                     and self._mergerz_update_install_thread.isRunning()):
                 self._mergerz_update_install_thread.request_cancel()
@@ -49335,7 +52398,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _present_independent_window(window):
-        """Show a top-level utility window and aggressively bring it frontmost."""
+        """Show a top-level utility window with platform-appropriate activation."""
         try:
             if window.isMinimized():
                 window.showNormal()
@@ -49343,6 +52406,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 window.show()
             window.raise_()
             window.activateWindow()
+
+            # On Windows the native owner/modal relationship handles z-order. Repeatedly
+            # re-activating the parent window can steal foreground from a progress or
+            # result dialog opened immediately afterward, so do not schedule retries.
+            if os.name == "nt":
+                return
 
             def reassert_front():
                 try:
@@ -49353,8 +52422,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-            # Linux window managers can defer stacking while another modal
-            # dialog is in the middle of an event loop. Reassert several times.
+            # Some Linux window managers defer stacking while another modal dialog
+            # is unwinding its event loop; retain the existing Linux recovery path.
             for delay in (0, 40, 120, 250):
                 QtCore.QTimer.singleShot(delay, reassert_front)
         except Exception:
@@ -49704,6 +52773,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_independent_modal_window(self.plugins_window)
 
     def open_settings(self, tab_index=0):
+        # A previous Settings session may have discovered an update. Always require a fresh
+        # manual check in the next session rather than reusing a stale Update button.
+        self.settings_page.reset_about_update_state()
         # Settings opens on the first tab (General) unless a caller selects another tab.
         self.settings_page._load_from_app_settings()
         try:
@@ -51768,6 +54840,247 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 # ============================================================
+# APPLICATION-WIDE SCROLLBAR STYLE
+# ============================================================
+# A complete stylesheet for every Qt scrollbar. Applying this directly to each
+# QScrollBar gives it precedence over per-screen/per-widget stylesheets, which
+# otherwise leave some subcontrols to the Windows native style (the source of
+# inconsistent textured/bright track regions). Both orientations and every
+# scrollbar subcontrol are explicitly styled.
+APPLICATION_SCROLLBAR_QSS = """
+QScrollBar {
+    background: #1a1a1a;
+    border: none;
+}
+QScrollBar:vertical {
+    width: 10px;
+    margin: 0px;
+    border: none;
+}
+QScrollBar::groove:vertical {
+    background: #1a1a1a;
+    margin: 0px;
+    border: none;
+}
+QScrollBar::handle:vertical {
+    background: #444444;
+    min-height: 30px;
+    margin: 1px;
+    border: none;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover { background: #555555; }
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    width: 0px;
+    height: 0px;
+    background: #1a1a1a;
+    border: none;
+}
+QScrollBar::up-arrow:vertical,
+QScrollBar::down-arrow:vertical {
+    width: 0px;
+    height: 0px;
+    background: #1a1a1a;
+    border: none;
+}
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: #1a1a1a;
+    border: none;
+}
+QScrollBar:horizontal {
+    height: 10px;
+    margin: 0px;
+    border: none;
+}
+QScrollBar::groove:horizontal {
+    background: #1a1a1a;
+    margin: 0px;
+    border: none;
+}
+QScrollBar::handle:horizontal {
+    background: #444444;
+    min-width: 30px;
+    margin: 1px;
+    border: none;
+    border-radius: 4px;
+}
+QScrollBar::handle:horizontal:hover { background: #555555; }
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0px;
+    height: 0px;
+    background: #1a1a1a;
+    border: none;
+}
+QScrollBar::left-arrow:horizontal,
+QScrollBar::right-arrow:horizontal {
+    width: 0px;
+    height: 0px;
+    background: #1a1a1a;
+    border: none;
+}
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: #1a1a1a;
+    border: none;
+}
+"""
+
+
+class _ApplicationScrollBarStyleFilter(QtCore.QObject):
+    """Enforce the shared scrollbar appearance for existing and future widgets.
+
+    Scrollbars are styled directly rather than only through QApplication QSS,
+    because Qt gives a widget's own stylesheet precedence over inherited
+    application stylesheets. This prevents local screen styles from reintroducing
+    platform-native Windows scrollbar painting.
+    """
+
+    @staticmethod
+    def _style_scrollbar(scrollbar):
+        try:
+            if scrollbar.styleSheet() != APPLICATION_SCROLLBAR_QSS:
+                scrollbar.setStyleSheet(APPLICATION_SCROLLBAR_QSS)
+        except (RuntimeError, AttributeError):
+            # Qt may already have destroyed a scrollbar queued by ChildAdded.
+            pass
+
+    @classmethod
+    def _style_scrollbars_in(cls, widget):
+        try:
+            if isinstance(widget, QtWidgets.QScrollBar):
+                cls._style_scrollbar(widget)
+                return
+            for scrollbar in widget.findChildren(QtWidgets.QScrollBar):
+                cls._style_scrollbar(scrollbar)
+        except (RuntimeError, AttributeError):
+            pass
+
+    @staticmethod
+    def _center_numeric_input(widget):
+        """Center the editable value in every integer/decimal spin box application-wide."""
+        try:
+            centered = QtCore.Qt.AlignmentFlag.AlignCenter
+            if widget.alignment() != centered:
+                widget.setAlignment(centered)
+        except (RuntimeError, AttributeError, TypeError):
+            pass
+
+    def eventFilter(self, watched, event):
+        try:
+            event_type = event.type()
+            if isinstance(watched, QtWidgets.QAbstractSpinBox) and event_type in (
+                QtCore.QEvent.Type.Polish,
+                QtCore.QEvent.Type.Show,
+                QtCore.QEvent.Type.ShowToParent,
+                QtCore.QEvent.Type.StyleChange,
+            ):
+                # QApplication-level event filters also see controls created later in
+                # PDF editors and dialogs, not only the widgets present at startup.
+                self._center_numeric_input(watched)
+            if isinstance(watched, QtWidgets.QScrollBar):
+                if event_type in (
+                    QtCore.QEvent.Type.Show,
+                    QtCore.QEvent.Type.ShowToParent,
+                    QtCore.QEvent.Type.StyleChange,
+                ):
+                    self._style_scrollbar(watched)
+            elif event_type == QtCore.QEvent.Type.ChildAdded:
+                child = event.child()
+                # ChildAdded can occur before a Qt widget is fully constructed.
+                # Defer styling until the event loop can safely inspect it.
+                if isinstance(child, (QtWidgets.QScrollBar, QtWidgets.QAbstractScrollArea)):
+                    QtCore.QTimer.singleShot(
+                        0, lambda target=child: self._style_scrollbars_in(target)
+                    )
+        except (RuntimeError, AttributeError, TypeError):
+            pass
+        return False
+
+
+class _MainMenuStorageRefreshFilter(QtCore.QObject):
+    """Refresh free storage whenever the last dialog/menu closes back to Main Menu.
+
+    Dialogs are opened through several different paths in Mergerz (independent
+    workflow windows, ordinary QDialog.exec(), file pickers, and nested editor
+    dialogs). Watching QDialog Close/Hide events at application scope covers
+    those routes without adding refresh calls to every individual menu handler.
+    """
+    def __init__(self, app, main_window):
+        super().__init__(app)
+        self._app = app
+        self._main_window = main_window
+        self._refresh_pending = False
+
+    def eventFilter(self, watched, event):
+        try:
+            if (
+                watched is not self._main_window
+                and isinstance(watched, QtWidgets.QDialog)
+                and watched.isWindow()
+                and event.type() in (
+                    QtCore.QEvent.Type.Hide,
+                    QtCore.QEvent.Type.Close,
+                )
+            ):
+                self._schedule_refresh()
+        except (RuntimeError, AttributeError, TypeError):
+            pass
+        return False
+
+    def _schedule_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        # Wait for nested dialog transitions and modal-loop unwinding to finish;
+        # otherwise a parent dialog may still be open when the check runs.
+        QtCore.QTimer.singleShot(140, self._refresh_if_back_at_menu)
+
+    def _refresh_if_back_at_menu(self):
+        self._refresh_pending = False
+        try:
+            if _APP_SHUTTING_DOWN or _RESTART_AFTER_UPDATE:
+                return
+            window = self._main_window
+            if window is None or not window.isVisible() or window.isMinimized():
+                return
+            if getattr(window, "stack", None) is not None:
+                if window.stack.currentWidget() is not getattr(window, "menu_page", None):
+                    return
+            active_workflow = getattr(window, "_active_workflow_window", None)
+            if active_workflow is not None and active_workflow.isVisible():
+                return
+            if self._app.activeModalWidget() is not None:
+                return
+            if self._app.activePopupWidget() is not None:
+                return
+
+            # A modal may be between Hide and its exec() return. Only refresh
+            # once every other visible application dialog has actually closed.
+            for top_level in self._app.topLevelWidgets():
+                if top_level is window or not top_level.isVisible():
+                    continue
+                if isinstance(top_level, QtWidgets.QDialog):
+                    return
+
+            menu_page = getattr(window, "menu_page", None)
+            if menu_page is None:
+                return
+            last_refresh = float(getattr(menu_page, "_last_storage_refresh_at", 0.0) or 0.0)
+            if time.monotonic() - last_refresh < 0.6:
+                # go_menu() or the manual refresh button may already have run for
+                # this same return transition.
+                return
+            menu_page.refresh_storage(animate=True)
+        except (RuntimeError, AttributeError, TypeError):
+            # Storage refresh is supplementary UI; it must never interfere with
+            # closing dialogs or normal shutdown.
+            return
+
+
+# ============================================================
 # DARK THEME
 # ============================================================
 DARK_QSS = """
@@ -51796,11 +55109,11 @@ QPushButton {
 QPushButton:hover { background-color: #3a3a3a; }
 QPushButton:pressed { background-color: #4a4a4a; }
 QPushButton:disabled { background-color: #222; color: #666; border-color: #2a2a2a; }
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #2a2a2a; color: #f0f0f0;
     border: 1px solid #3a3a3a; border-radius: 4px; padding: 6px;
 }
-QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QComboBox:focus {
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #0078d7;
 }
 QComboBox::drop-down { border: none; width: 22px; }
@@ -51810,17 +55123,33 @@ QComboBox QAbstractItemView {
     border: 1px solid #3a3a3a;
 }
 QScrollArea { border: none; background: transparent; }
-QScrollBar:vertical { background: #1e1e1e; width: 12px; margin: 0; }
+QAbstractScrollArea::corner { background: #1a1a1a; border: none; }
+QScrollBar:vertical { background: #1a1a1a; width: 10px; margin: 0; border: none; }
+QScrollBar::groove:vertical { background: #1a1a1a; margin: 0; border: none; }
 QScrollBar::handle:vertical {
-    background: #3a3a3a; border-radius: 6px; min-height: 20px;
+    background: #444444; border: none; border-radius: 4px; min-height: 30px; margin: 1px;
 }
-QScrollBar::handle:vertical:hover { background: #4a4a4a; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal { background: #1e1e1e; height: 12px; margin: 0; }
+QScrollBar::handle:vertical:hover { background: #555555; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
+    height: 0px; width: 0px; background: #1a1a1a; border: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: #1a1a1a; border: none;
+}
+QScrollBar:horizontal { background: #1a1a1a; height: 10px; margin: 0; border: none; }
+QScrollBar::groove:horizontal { background: #1a1a1a; margin: 0; border: none; }
 QScrollBar::handle:horizontal {
-    background: #3a3a3a; border-radius: 6px; min-width: 20px;
+    background: #444444; border: none; border-radius: 4px; min-width: 30px; margin: 1px;
 }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::handle:horizontal:hover { background: #555555; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal {
+    height: 0px; width: 0px; background: #1a1a1a; border: none;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: #1a1a1a; border: none;
+}
 QProgressBar {
     background-color: #2a2a2a; color: #fff;
     border: 1px solid #3a3a3a; border-radius: 6px;
@@ -51851,16 +55180,9 @@ def main():
     except (RuntimeError, ValueError):
         pass
 
-    # Remove stale working artifacts from interrupted previous runs before any workflow starts.
-    # Individual workflows still clean their own temporary jobs during normal completion; this
-    # startup sweep recovers files left behind by crashes, forced exits, or terminated workers.
-    try:
-        remove_temp_folder(max_retries=3, delay=0.15)
-    except Exception:
-        try:
-            os.makedirs(TEMP_FOLDER, exist_ok=True)
-        except Exception:
-            pass
+    # Prepare a fresh temp workspace before constructing the UI. Large leftovers are detached
+    # immediately and deleted in the background, avoiding a slow startup-time recursive delete.
+    _start_background_temp_cleanup()
 
     _ensure_icons_exist()
 
@@ -51878,10 +55200,21 @@ def main():
     app.setApplicationName("Mergerz")
     app.setApplicationVersion(__version__)
     app.setStyleSheet(DARK_QSS)
+    _scrollbar_style_filter = _ApplicationScrollBarStyleFilter(app)
+    app.installEventFilter(_scrollbar_style_filter)
+    # Keep a Python reference for the lifetime of QApplication.
+    app._scrollbar_style_filter = _scrollbar_style_filter
     _window_chrome_manager = _WindowChromeManager(app)
     app._window_chrome_manager = _window_chrome_manager
 
     window = MainWindow()
+    _storage_refresh_filter = _MainMenuStorageRefreshFilter(app, window)
+    app.installEventFilter(_storage_refresh_filter)
+    # Keep a Python reference for the lifetime of QApplication.
+    app._main_menu_storage_refresh_filter = _storage_refresh_filter
+    # Also style every scrollbar already constructed during MainWindow setup;
+    # the event filter then covers dialogs/pages created later in the session.
+    _scrollbar_style_filter._style_scrollbars_in(window)
 
     def _about_to_quit():
         # MainWindow.closeEvent normally runs this first. Keep this handler as a
@@ -51891,15 +55224,14 @@ def main():
 
     app.aboutToQuit.connect(_about_to_quit)
     window.show()
+    # Release notes are shown once for each installed Mergerz version. Persist the marker
+    # before opening the modal dialog so closing/retrying it does not create repeat popups.
+    QtCore.QTimer.singleShot(700, window._maybe_open_startup_changelog)
 
     # The core update checker is deliberately launched only after the main window has
-    # been shown and the first paint can complete. This keeps network/DNS/TLS work
-    # completely out of the startup path. The check itself runs in PluginTaskThread.
-    if not MERGERZ_TEST_MODE:
-        QtCore.QTimer.singleShot(1200, window._begin_mergerz_update_check)
-
-    # Recover stale work files from previous/crashed sessions without blocking the Qt event loop.
-    QtCore.QTimer.singleShot(0, _start_background_temp_cleanup)
+    # been shown and the first paint can complete. Network work runs in PluginTaskThread.
+    # Testing mode uses the same update check so the updater can be exercised before release.
+    QtCore.QTimer.singleShot(1200, window._begin_mergerz_update_check)
 
     try:
         return_code = app.exec()
@@ -51923,13 +55255,69 @@ def main():
     # replaces this process image with a fresh interpreter so the newly-installed package
     # is loaded immediately. The restart path is intentionally kept here rather than in
     # __init__.py, where package import side effects would make updates unsafe.
-    if _RESTART_AFTER_UPDATE:
+    if _RESTART_AFTER_UPDATE and MERGERZ_TEST_MODE:
+        # In testing mode, update the installed distribution but restart the source test
+        # launcher (normally caller.py), not the installed release console-script.
+        test_launcher = None
+        candidates = []
+        try:
+            argv0 = str(sys.argv[0] or "").strip()
+            if argv0 and argv0 not in {"-c", "-m"}:
+                candidates.append(Path(argv0).expanduser())
+        except Exception:
+            pass
+        candidates.extend((Path.cwd() / "caller.py", _PACKAGE_ROOT / "caller.py", _PACKAGE_ROOT.parent / "caller.py"))
+        seen_candidates = set()
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+                if candidate in seen_candidates:
+                    continue
+                seen_candidates.add(candidate)
+                if candidate.is_file() and candidate.suffix.lower() == ".py":
+                    test_launcher = str(candidate)
+                    # Prefer the caller launcher specifically if more than one script exists.
+                    if candidate.name.lower() == "caller.py":
+                        break
+            except Exception:
+                continue
+
+        if test_launcher:
+            restart_args = [sys.executable, test_launcher, *sys.argv[1:]]
+        else:
+            # Never silently fall back to the installed release launcher in test mode.
+            # This source-module fallback still honors the testing resource environment.
+            restart_args = [sys.executable, str(Path(__file__).resolve())]
+        restart_env = os.environ.copy()
+        restart_env[MERGERZ_TEST_MODE_ENV] = "1"
+        try:
+            os.execve(sys.executable, restart_args, restart_env)
+        except Exception:
+            try:
+                kwargs = {
+                    "cwd": os.getcwd(),
+                    "env": restart_env,
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                }
+                if os.name == "nt":
+                    kwargs["creationflags"] = (
+                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    )
+                else:
+                    kwargs["start_new_session"] = True
+                subprocess.Popen(restart_args, **kwargs)
+            except Exception:
+                pass
+    elif _RESTART_AFTER_UPDATE:
         # Restart exactly the same installed console entry point the user launched.
         # This is preferable to `python -m mergerz.module`: this package's __init__.py
         # imports mergerz.module, so runpy would otherwise report:
         #   module found in sys.modules after import of package ...
         # The console launcher also guarantees that the same virtual environment and
-        # installed distribution are used after the in-place pip upgrade.
+        # installed distribution are used after the in-place UV upgrade.
         launcher = None
         try:
             candidate = shutil.which("mergerz")

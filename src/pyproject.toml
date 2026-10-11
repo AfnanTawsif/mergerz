@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mergerz"
-version = "5.0.8"
+version = "5.0.9"
 description = "Mergerz is a powerful PDF utility."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,7 @@ dependencies = [
     "pikepdf",
     "PySide6",
     "python-iso639",
+    "uv>=0.10.0",
 ]
 
 [project.gui-scripts]
@@ -42,5 +43,6 @@ include = ["mergerz*"]
 [tool.setuptools.package-data]
 mergerz = [
     "icons/*.svg",
+    "icons/*.jpg",
     "fonts/*.ttf",
 ]

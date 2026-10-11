@@ -1,6 +1,9 @@
 # Mergerz Screenshots
 
-⚠️ Screenshots may be outdated. This section provides a glimpse of the UI, not a representation of the full experience. 
+> [!NOTE]
+> **Screenshots may be outdated.**
+>
+> These images offer a visual glimpse of Mergerz and may not reflect the latest UI or the full user experience.
 
 <p align="center">
   <img src="./screenshot1.webp" alt="Mergerz screenshot 1" width="500">

@@ -25,7 +25,7 @@ This means less unnecessary bloat, faster processing, better scalability, and be
 - Python 3.10 or newer
 - PySide6-supported desktop platform
 
-Optional functionality such as OCR, PDF-to-DOCX and LibreOffice conversion can be installed separately through Mergerz's plugin system.
+For windows, you must select **Add to PATH** during python installation.
 
 ## Install & Launch
 
@@ -37,7 +37,7 @@ Then launch using:
 
 `mergerz`
 
-That is it.
+Optional functionality such as OCR, PDF-to-DOCX and LibreOffice conversion can be installed separately through Mergerz's plugin system.
 
 ---
 

@@ -1,5 +1,7 @@
 # Mergerz Screenshots
 
+⚠️ Screenshots may be outdated. This section provides a glimpse of the UI, not a representation of the full experience. 
+
 <p align="center">
   <img src="./screenshot1.webp" alt="Mergerz screenshot 1" width="500">
 </p>

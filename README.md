@@ -24,9 +24,10 @@ This means less unnecessary bloat, faster processing, better scalability, and be
 
 - Python 3.10 or newer
 - Linux, Windows, MacOS & other Pyside6 supported platforms.
-(The app is heavily tested only on Kubuntu)
 
 For windows, you must select **Add to PATH** during python installation.
+
+The app is heavily tested only on Kubuntu.
 
 ## Install & Launch
 

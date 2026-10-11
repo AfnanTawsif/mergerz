@@ -130,11 +130,15 @@ Large workloads should be able to use multiprocessing, worker pools, caching and
 
 ---
 
-# Changelog
+# Changelog & FAQ
 
-See the full release history:
+**[View changelog history →](./online/changelog.json)**
 
-https://github.com/AfnanTawsif/mergerz/releases
+CDN: `https://cdn.jsdelivr.net/gh/AfnanTawsif/mergerz@main/online/changelog.json`
+
+**[Frequently asked questions →](./online/faq.md)**
+
+CDN: `https://cdn.jsdelivr.net/gh/AfnanTawsif/mergerz@main/online/faq.md`
 
 ---
 

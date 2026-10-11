@@ -31,15 +31,62 @@ The app is heavily tested only on Kubuntu.
 
 ## Install & Launch
 
+# Installation
+
+## Requirements
+
+- Windows / Linux / macOS / other PySide6-supported platforms.
+- Python 3.10 or newer.
+
+For Windows, you must select **Add Python to PATH** during Python installation.
+
+The app is heavily tested only on Kubuntu.
+
+## Install & Launch
+
+<details>
+<summary>Create a virtual environment (optional)</summary>
+
+Create a virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+Activate it:
+
+- **Windows (Command Prompt):**
+  ```bat
+  .venv\Scripts\activate.bat
+  ```
+
+- **Windows (PowerShell):**
+  ```powershell
+  .venv\Scripts\Activate.ps1
+  ```
+
+- **Linux / macOS:**
+  ```bash
+  source .venv/bin/activate
+  ```
+
+</details>
+
 Install or upgrade Mergerz with:
 
-`python -m pip install --upgrade mergerz`
+```bash
+python -m pip install --upgrade mergerz
+```
 
 Then launch using:
 
-`mergerz`
+```bash
+mergerz
+```
 
-Optional functionality such as OCR, PDF-to-DOCX and LibreOffice conversion can be installed separately through Mergerz's plugin system.
+Optional functionality such as OCR, PDF-to-DOCX, and LibreOffice conversion can be installed separately through Mergerz's plugin system.
+
+---
 
 ---
 

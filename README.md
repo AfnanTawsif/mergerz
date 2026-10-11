@@ -74,7 +74,6 @@ mergerz
 
 Optional functionality such as OCR, PDF-to-DOCX, and LibreOffice conversion can be installed separately through Mergerz's plugin system.
 
----
 
 # Why Choose Mergerz?
 
@@ -125,7 +124,6 @@ Heavy optional features are separated from the core installation. OCR, PDF-to-DO
 
 The application uses a custom dark desktop interface with custom window chrome, responsive layouts, modern dialogs, live previews and carefully designed workflow screens.
 
----
 
 # Design Philosophy
 
@@ -163,7 +161,6 @@ Small tasks should stay lightweight.
 
 Large workloads should be able to use multiprocessing, worker pools, caching and memory-aware strategies.
 
----
 
 # Changelog & FAQ
 
@@ -175,7 +172,6 @@ CDN: `https://cdn.jsdelivr.net/gh/AfnanTawsif/mergerz@main/online/changelog.json
 
 CDN: `https://cdn.jsdelivr.net/gh/AfnanTawsif/mergerz@main/online/faq.md`
 
----
 
 # Issues & Feature Requests
 
@@ -183,7 +179,6 @@ Bug reports, feature requests and technical feedback are welcome through GitHub 
 
 https://github.com/AfnanTawsif/mergerz/issues
 
----
 
 # Contact
 
@@ -194,7 +189,6 @@ For questions, feedback or development-related contact:
 - Telegram: https://t.me/KindaDeadNgl
 - Email: acer.only2001@gmail.com
 
----
 
 # License
 
@@ -204,7 +198,6 @@ Mergerz is free to use, but the source code, application, branding and associate
 
 Do not redistribute, relicense, modify for redistribution, or commercially repackage the project without permission from the author.
 
----
 
 <p align="center">
   <b>Mergerz</b><br>

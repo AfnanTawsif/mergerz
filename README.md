@@ -198,6 +198,7 @@ Mergerz is free to use, but the source code, application, branding and associate
 
 Do not redistribute, relicense, modify for redistribution, or commercially repackage the project without permission from the author.
 
+---
 
 <p align="center">
   <b>Mergerz</b><br>

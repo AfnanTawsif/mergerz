@@ -22,7 +22,7 @@ This means less unnecessary bloat, faster processing, better scalability, and be
 
 ## Requirements
 
-- Linux, Windows, MacOS & other Pyside6 supported platforms.
+- Windows, Linux, MacOS & other Pyside6 supported platforms.
 - Python 3.10 or newer
 
 For windows, you must select **Add to PATH** during python installation.

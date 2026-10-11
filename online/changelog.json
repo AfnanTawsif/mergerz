@@ -2,8 +2,8 @@
   {
     "version": "v5.0.11",
     "logs": [
-      "Added exit button for text finder in PDF viewers",
-      "Reduced default height of PDF editing menu"
+      "Added exit button for text finder in pdf viewers",
+      "Reduced the default height of these windows: home, pdf editing, pdf optimization"
     ]
   },
   {

@@ -18,18 +18,7 @@ Mergerz is built around a **PDF-native editing philosophy**. Operations such as 
 
 This means less unnecessary bloat, faster processing, better scalability, and better preservation of vectors, text, and overall document quality.
 
-# Installation
-
-## Requirements
-
-- Windows / Linux / MacOS / Other Pyside6 supported platforms.
-- Python 3.10 or newer
-
-For windows, you must select **Add to PATH** during python installation.
-
-The app is heavily tested only on Kubuntu.
-
-## Install & Launch
+---
 
 # Installation
 
@@ -85,8 +74,6 @@ mergerz
 ```
 
 Optional functionality such as OCR, PDF-to-DOCX, and LibreOffice conversion can be installed separately through Mergerz's plugin system.
-
----
 
 ---
 

@@ -2,7 +2,21 @@
   {
     "version": "v5.0.9",
     "logs": [
-      "Updated databse & icons link"
+      "Added a pan tool to the Full PDF Viewer for easier page navigation",
+      "Added an Equal spacing option for page borders",
+      "Added Settings > About with manual update checks, changelog, and FAQ",
+      "Moved plugin installation and application updates to UV for faster, more reliable installs and updates",
+      "Added separate Python version selection for each plugin",
+      "Fixed OCR plugin installation by including the required PaddlePaddle dependency",
+      "Introduced a consistent custom scrollbar design across the app",
+      "Fixed thumbnails appearing too small or not filling the grid on high-DPI displays",
+      "Fixed the crop preview so selected filters display correctly",
+      "Fixed a Windows file-lock issue in Make Printable",
+      "Storage information now refreshes automatically when returning to the main menu",
+      "Switched to the native Windows title bar to improve button responsiveness when windows overlap",
+      "Improved LibreOffice runtime extraction for better compatibility",
+      "Made startup cleanup faster by moving leftover temporary-file cleanup into the background",
+      "Removed redundant code and made other minor improvements"
     ]
   },
   {

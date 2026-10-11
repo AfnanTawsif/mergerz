@@ -1,5 +1,12 @@
 [
   {
+    "version": "v5.0.10",
+    "logs": [
+      "Added exit button for text finder in PDF viewers",
+      "Reduced default height of PDF editing menu"
+    ]
+  },
+  {
     "version": "v5.0.9",
     "logs": [
       "Added a pan tool to the Full PDF Viewer for easier page navigation",

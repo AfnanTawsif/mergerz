@@ -60,6 +60,7 @@ Mergerz includes a dedicated full document viewer rather than forcing every PDF 
 - Smooth page viewing
 - Zoom in/out
 - Fit-to-width viewing
+- Pan / Move around
 - Page navigation
 - Page indicators
 - Text selection
